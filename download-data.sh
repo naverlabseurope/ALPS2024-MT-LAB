@@ -30,3 +30,6 @@ if [ ! -f data/train.en-it.it ]; then
     cat data/train.en-it.{en,it} | subword-nmt learn-bpe -o data/bpecodes.en-it -s 8000 -v
     cat data/train.en-fr.{en,fr} data/train.de-en.de data/train.en-it.it | subword-nmt learn-bpe -o data/bpecodes.de-en-fr-it -s 8000 -v
 fi
+
+wget -nc https://www.dropbox.com/s/mxwamwnrs374bev/models.zip
+unzip models.zip
