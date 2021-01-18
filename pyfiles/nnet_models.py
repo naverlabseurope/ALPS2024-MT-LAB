@@ -27,16 +27,16 @@ def alps_multi_head_attention_forward(
     dropout_p,
     out_proj_weight,
     out_proj_bias,
-    training,
-    key_padding_mask,
-    need_weights,
-    attn_mask,
-    use_separate_proj_weight,
-    q_proj_weight,
-    k_proj_weight,
-    v_proj_weight,
-    static_k,
-    static_v):
+    training=True,
+    key_padding_mask=None,
+    need_weights=True,
+    attn_mask=None,
+    use_separate_proj_weight=False,
+    q_proj_weight=None,
+    k_proj_weight=None,
+    v_proj_weight=None,
+    static_k=None,
+    static_v=None):
     r"""
     Args:
         query, key, value: map a query and a set of key-value pairs to an output.
