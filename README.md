@@ -6,6 +6,8 @@ This repository is a modified version of [another tutorial on NMT](https://githu
 ### Installation
 
 ```
-./setup.sh
-./run-notebook.sh
+git clone https://github.com/naverlabseurope/ALPS2021-MT-LAB.git --recursive
+cd ALPS2021-MT-LAB
+./setup.sh            # creates a Python environment, installs the dependencies, downloads and pre-processes the data and downloads the pre-trained models
+./run-notebook.sh     # starts a jupyter notebook where the lab will take place
 ```
