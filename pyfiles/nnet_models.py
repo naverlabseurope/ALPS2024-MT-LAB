@@ -805,7 +805,7 @@ class EncoderDecoder(nn.Module):
             predicted_list = [detokenize(line) for line in predicted_list]
             real_list = [detokenize(line) for line in real_list]
 
-        bleu = sacrebleu.corpus_bleu(predicted_list, [real_list], tokenize='none')
+        bleu = sacrebleu.corpus_bleu(predicted_list, [real_list], tokenize='none', force=True)
         translation_output = namedtuple('translation_output', ['score', 'output'])
         return translation_output(round(bleu.score, 2), predicted_list)
 

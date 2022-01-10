@@ -6,7 +6,7 @@ fi
 
 source env/bin/activate
 
-pip install torch
+pip install torch==1.7.1
 pip install jupyter
 pip install subword-nmt
 pip install sacremoses
