@@ -21,15 +21,19 @@ if [ ! -f data/bpecodes.de-en-fr ]; then
 fi
 
 # Download data for other languages (e.g., italian). Replace with the language of your choice.
-if [ ! -f data/train.en-it.it ]; then
-    pushd data
-    wget -nc https://www.manythings.org/anki/ita-eng.zip
-    unzip -o ita-eng.zip
-    popd
-    python3 pyfiles/prepare.py data/ita.txt
-    cat data/train.en-it.{en,it} | subword-nmt learn-bpe -o data/bpecodes.en-it -s 8000 -v
-    cat data/train.en-fr.{en,fr} data/train.de-en.de data/train.en-it.it | subword-nmt learn-bpe -o data/bpecodes.de-en-fr-it -s 8000 -v
+# if [ ! -f data/train.en-it.it ]; then
+#     pushd data
+#     wget -nc https://www.manythings.org/anki/ita-eng.zip
+#     unzip -o ita-eng.zip
+#     popd
+#     python3 pyfiles/prepare.py data/ita.txt
+#     cat data/train.en-it.{en,it} | subword-nmt learn-bpe -o data/bpecodes.en-it -s 8000 -v
+#     cat data/train.en-fr.{en,fr} data/train.de-en.de data/train.en-it.it | subword-nmt learn-bpe -o data/bpecodes.de-en-fr-it -s 8000 -v
+# fi
+
+# Download pre-trained model from Dropbox
+if [ ! -f models/en-fr/pretrained-transformer.pt ]; then
+    wget -nc https://www.dropbox.com/s/14cxqgfaahagprl/models.zip
+    unzip models.zip
 fi
 
-wget -nc https://www.dropbox.com/s/mxwamwnrs374bev/models.zip
-unzip models.zip

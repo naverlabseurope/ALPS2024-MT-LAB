@@ -7,17 +7,8 @@ import nmt_dataset
 import nnet_models
 import numpy as np
 import torch
-import torch.nn as nn
-from torch import optim
-import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-from functools import partial
 import time
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import copy
 from subword_nmt.apply_bpe import BPE
 
 import argparse
@@ -79,8 +70,8 @@ else:
     source_lang, target_lang = 'src', 'tgt'
 source_langs = set(src for src, _ in lang_pairs)
 target_langs = set(tgt for _, tgt in lang_pairs)
-source_dict_path = args.source_dict or os.path.join(model_dir, 'dict.{}.txt'.format(source_lang))
-target_dict_path = args.target_dict or os.path.join(model_dir, 'dict.{}.txt'.format(target_lang))
+source_dict_path = args.source_dict or os.path.join(model_dir, f'dict.{source_lang}.txt')
+target_dict_path = args.target_dict or os.path.join(model_dir, f'dict.{target_lang}.txt')
 shared_embeddings = args.shared_embeddings
 
 
@@ -94,7 +85,7 @@ with open(bpe_path) as bpe_codes:
 def preprocess(line, is_source=True, source_lang=None, target_lang=None):
     line = bpe_model.segment(line.lower())
     if len(target_langs) > 1:
-        line = '<lang:{}> {}'.format(target_lang, line)
+        line = f'<lang:{target_lang}> {line}'
     return line
 
 def postprocess(line):
@@ -172,12 +163,6 @@ else:
     train_iterator = train_iterators[0]
 
 
-def save_model(model, checkpoint_path):
-    dirname = os.path.dirname(checkpoint_path)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
-    torch.save(model, checkpoint_path)
-
 def train_model(
         train_iterator,
         valid_iterators,
@@ -197,23 +182,24 @@ def train_model(
 
     reset_seed()
 
-    best_bleu = -1
+    best_score = -1
     for epoch in range(1, epochs + 1):
 
         start = time.time()
         running_loss = 0
 
-        print('Epoch: [{}/{}]'.format(epoch, epochs))
+        print(f'Epoch: [{epoch}/{epochs}]')
 
         # Iterate over training batches for one epoch
         for i, batch in enumerate(train_iterator, 1):
             t = time.time()
             if verbose:
                 sys.stdout.write(
-                    "\r{}/{}, wall={:.2f}".format(
+                    "\r{}/{}, wall={:.2f}, loss={:.3f}".format(
                         i,
                         len(train_iterator),
-                        time.time() - start
+                        time.time() - start,
+                        running_loss / i,
                     )
                 )
             running_loss += model.train_step(batch)
@@ -224,44 +210,44 @@ def train_model(
         # Average training loss for this epoch
         epoch_loss = running_loss / len(train_iterator)
 
-        print("loss={:.3f}, time={:.2f}".format(epoch_loss, time.time() - start))
+        print(f"loss={epoch_loss:.3f}, time={time.time() - start:.2f}")
         sys.stdout.flush()
 
         # Evaluate and save the model
         if epoch % validation_frequency == 0:
-            bleu_scores = []
+            scores = []
             
-            # Compute BLEU over all validation sets
+            # Compute chrF over all validation sets
             for valid_iterator in valid_iterators:
                 src, tgt = valid_iterator.source_lang, valid_iterator.target_lang
                 translation_output = model.translate(valid_iterator, postprocess)
-                bleu_score = translation_output.score
+                score = translation_output.score
                 output = translation_output.output
 
-                with open(os.path.join(model_dir, 'valid.{}-{}.{}.out'.format(src, tgt, epoch)), 'w') as f:
+                with open(os.path.join(model_dir, f'valid.{src}-{tgt}.{epoch}.out'), 'w') as f:
                     f.writelines(line + '\n' for line in output)
 
-                print('{}-{}: BLEU={}'.format(src, tgt, bleu_score))
+                print(f'{src}-{tgt}: chrF={score}')
                 sys.stdout.flush()
-                bleu_scores.append(bleu_score)
+                scores.append(score)
 
-            # Average the validation BLEU scores
-            bleu_score = round(sum(bleu_scores) / len(bleu_scores), 2)
-            if len(bleu_scores) > 1:
-                print('BLEU={}'.format(bleu_score))
+            # Average the validation chrF scores
+            score = round(sum(scores) / len(scores), 2)
+            if len(scores) > 1:
+                print(f'chrF={score}')
 
             # Update the model's learning rate based on current performance.
-            # This scheduler divides the learning rate by 10 if BLEU does not improve.
-            model.scheduler_step(bleu_score)
+            # This scheduler divides the learning rate by 10 if chrF does not improve.
+            model.scheduler_step(score)
 
-            # Save a model checkpoint if it has the best validation BLEU so far
-            if bleu_score > best_bleu:
-                best_bleu = bleu_score
-                save_model(model, checkpoint_path)
+            # Save a model checkpoint if it has the best validation chrF so far
+            if score > best_score:
+                best_score = score
+                model.save(checkpoint_path)
 
         print('=' * 50)
 
-    print("Training completed. Best BLEU is {}".format(best_bleu))
+    print(f'Training completed. Best chrF is {best_score}')
 
 
 encoder = nnet_models.TransformerEncoder(

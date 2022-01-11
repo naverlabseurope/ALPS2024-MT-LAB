@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import optim
 import torch.nn as nn
@@ -320,7 +321,9 @@ def alps_multi_head_attention_forward(
     else:
         return attn_output, None, None
 
+
 setattr(F, 'multi_head_attention_forward', alps_multi_head_attention_forward)
+
 
 class BagOfWords(nn.Module):
     def __init__(
@@ -330,7 +333,7 @@ class BagOfWords(nn.Module):
         reduce="sum",
         num_layers=2,
         activation="ReLU",
-        dropout=0
+        dropout=0,
     ):
         super(BagOfWords, self).__init__()
 
@@ -511,7 +514,7 @@ class AttentionDecoder(nn.Module):
             self,
             output_size,
             hidden_size,
-            dropout=0
+            dropout=0,
         ):
         super(AttentionDecoder, self).__init__()
 
@@ -587,7 +590,7 @@ class TransformerEncoder(nn.Module):
             num_layers=1,
             dropout=0,
             heads=4,
-            normalize_before=False
+            normalize_before=False,
         ):
         super(TransformerEncoder, self).__init__()
 
@@ -634,7 +637,7 @@ class TransformerDecoder(nn.Module):
             num_layers=1,
             dropout=0,
             heads=4,
-            normalize_before=False
+            normalize_before=False,
         ):
         super(TransformerDecoder, self).__init__()
 
@@ -768,9 +771,8 @@ class EncoderDecoder(nn.Module):
                 self.decoder.parameters(), self.clip)
         self.optimizer.step()
 
-    def scheduler_step(self, val_bleu=None):
-        self.scheduler.step(val_bleu)
-        # self.scheduler.step()
+    def scheduler_step(self, val_score=None):
+        self.scheduler.step(val_score)
 
     def vec2txt(self, vector):
         """Convert vector to text.
@@ -805,9 +807,9 @@ class EncoderDecoder(nn.Module):
             predicted_list = [detokenize(line) for line in predicted_list]
             real_list = [detokenize(line) for line in real_list]
 
-        bleu = sacrebleu.corpus_bleu(predicted_list, [real_list], tokenize='none', force=True)
+        chrf = sacrebleu.corpus_chrf(predicted_list, [real_list])
         translation_output = namedtuple('translation_output', ['score', 'output'])
-        return translation_output(round(bleu.score, 2), predicted_list)
+        return translation_output(round(chrf.score, 2), predicted_list)
 
     def train_step(self, batch):
         xs, xs_len, ys, ys_len = batch['source'], batch['source_len'], batch['target'], batch['target_len']
@@ -914,6 +916,26 @@ class EncoderDecoder(nn.Module):
         
         attn = None if attn_wts_list[0] is None else torch.cat(attn_wts_list, 1)
         return self.vec2txt(predictions), attn, encoder_self_attn
+
+    def load(self, path):
+        if os.path.isfile(path):
+            ckpt = torch.load(path)
+            self.load_state_dict(ckpt['model'])
+            if ckpt.get('scheduler'):
+                self.scheduler.load_state_dict(ckpt['scheduler'])
+            if ckpt.get('optimizer'):
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+
+    def save(self, path):
+        dirname = os.path.dirname(path)
+        if dirname:
+            os.makedirs(dirname, exist_ok=True)
+        ckpt = {
+            'model': self.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict(),
+        }
+        torch.save(ckpt, path)
 
 
 class TransformerEncoderLayer(nn.TransformerEncoderLayer):
