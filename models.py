@@ -4,325 +4,73 @@ from torch import optim
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-# for monkey patching the default multi_head_attention_forward method
-from torch.nn.functional import *
 import math
 from collections import namedtuple
 
 import sacrebleu
 
-from nmt_dataset import PAD_IDX, SOS_IDX, EOS_IDX
+from data import PAD_IDX, SOS_IDX, EOS_IDX
 
 
-def alps_multi_head_attention_forward(
-    query,
-    key,
-    value,
-    embed_dim_to_check,
-    num_heads,
-    in_proj_weight,
-    in_proj_bias,
-    bias_k,
-    bias_v,
-    add_zero_attn,
-    dropout_p,
-    out_proj_weight,
-    out_proj_bias,
-    training=True,
-    key_padding_mask=None,
-    need_weights=True,
-    attn_mask=None,
-    use_separate_proj_weight=False,
-    q_proj_weight=None,
-    k_proj_weight=None,
-    v_proj_weight=None,
-    static_k=None,
-    static_v=None):
-    r"""
-    Args:
-        query, key, value: map a query and a set of key-value pairs to an output.
-            See "Attention Is All You Need" for more details.
-        embed_dim_to_check: total dimension of the model.
-        num_heads: parallel attention heads.
-        in_proj_weight, in_proj_bias: input projection weight and bias.
-        bias_k, bias_v: bias of the key and value sequences to be added at dim=0.
-        add_zero_attn: add a new batch of zeros to the key and
-                       value sequences at dim=1.
-        dropout_p: probability of an element to be zeroed.
-        out_proj_weight, out_proj_bias: the output projection weight and bias.
-        training: apply dropout if is ``True``.
-        key_padding_mask: if provided, specified padding elements in the key will
-            be ignored by the attention. This is an binary mask. When the value is True,
-            the corresponding value on the attention layer will be filled with -inf.
-        need_weights: output attn_output_weights.
-        attn_mask: 2D or 3D mask that prevents attention to certain positions. A 2D mask will be broadcasted for all
-            the batches while a 3D mask allows to specify a different mask for the entries of each batch.
-        use_separate_proj_weight: the function accept the proj. weights for query, key,
-            and value in different forms. If false, in_proj_weight will be used, which is
-            a combination of q_proj_weight, k_proj_weight, v_proj_weight.
-        q_proj_weight, k_proj_weight, v_proj_weight, in_proj_bias: input projection weight and bias.
-        static_k, static_v: static key and value used for attention operators.
-    Shape:
-        Inputs:
-        - query: :math:`(L, N, E)` where L is the target sequence length, N is the batch size, E is
-          the embedding dimension.
-        - key: :math:`(S, N, E)`, where S is the source sequence length, N is the batch size, E is
-          the embedding dimension.
-        - value: :math:`(S, N, E)` where S is the source sequence length, N is the batch size, E is
-          the embedding dimension.
-        - key_padding_mask: :math:`(N, S)` where N is the batch size, S is the source sequence length.
-          If a ByteTensor is provided, the non-zero positions will be ignored while the zero positions
-          will be unchanged. If a BoolTensor is provided, the positions with the
-          value of ``True`` will be ignored while the position with the value of ``False`` will be unchanged.
-        - attn_mask: 2D mask :math:`(L, S)` where L is the target sequence length, S is the source sequence length.
-          3D mask :math:`(N*num_heads, L, S)` where N is the batch size, L is the target sequence length,
-          S is the source sequence length. attn_mask ensures that position i is allowed to attend the unmasked
-          positions. If a ByteTensor is provided, the non-zero positions are not allowed to attend
-          while the zero positions will be unchanged. If a BoolTensor is provided, positions with ``True``
-          are not allowed to attend while ``False`` values will be unchanged. If a FloatTensor
-          is provided, it will be added to the attention weight.
-        - static_k: :math:`(N*num_heads, S, E/num_heads)`, where S is the source sequence length,
-          N is the batch size, E is the embedding dimension. E/num_heads is the head dimension.
-        - static_v: :math:`(N*num_heads, S, E/num_heads)`, where S is the source sequence length,
-          N is the batch size, E is the embedding dimension. E/num_heads is the head dimension.
-        Outputs:
-        - attn_output: :math:`(L, N, E)` where L is the target sequence length, N is the batch size,
-          E is the embedding dimension.
-        - attn_output_weights: :math:`(N, L, S)` where N is the batch size,
-          L is the target sequence length, S is the source sequence length.
-        - attn_output_weights_all_heads: :math:`(N, H, L, S)` where N is the batch size, H is the `num_heads`,
-          L is the target sequence length, S is the source sequence length.
-    """
-    tens_ops = (query, key, value, in_proj_weight, in_proj_bias, bias_k, bias_v, out_proj_weight, out_proj_bias)
-    if has_torch_function(tens_ops):
-        return handle_torch_function(
-            multi_head_attention_forward,
-            tens_ops,
-            query,
-            key,
-            value,
-            embed_dim_to_check,
-            num_heads,
-            in_proj_weight,
-            in_proj_bias,
-            bias_k,
-            bias_v,
-            add_zero_attn,
-            dropout_p,
-            out_proj_weight,
-            out_proj_bias,
-            training=training,
-            key_padding_mask=key_padding_mask,
-            need_weights=need_weights,
-            attn_mask=attn_mask,
-            use_separate_proj_weight=use_separate_proj_weight,
-            q_proj_weight=q_proj_weight,
-            k_proj_weight=k_proj_weight,
-            v_proj_weight=v_proj_weight,
-            static_k=static_k,
-            static_v=static_v,
-        )
-    tgt_len, bsz, embed_dim = query.size()
-    assert embed_dim == embed_dim_to_check
-    # allow MHA to have different sizes for the feature dimension
-    assert key.size(0) == value.size(0) and key.size(1) == value.size(1)
+class MultiheadAttention(nn.Module):
+    """ Copied from fairseq """
 
-    head_dim = embed_dim // num_heads
-    assert head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
-    scaling = float(head_dim) ** -0.5
+    def __init__(self, embed_dim, num_heads, dropout=0.0):
+        super(MultiheadAttention, self).__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout = nn.Dropout(dropout)
+        self.head_dim = embed_dim // num_heads
+        assert (self.head_dim * num_heads == embed_dim), 'embed_dim must be divisible by num_heads'
+        self.scaling = self.head_dim ** -0.5
+        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        self.reset_parameters()
 
-    if not use_separate_proj_weight:
-        if (query is key or torch.equal(query, key)) and (key is value or torch.equal(key, value)):
-            # self-attention
-            q, k, v = linear(query, in_proj_weight, in_proj_bias).chunk(3, dim=-1)
+    def reset_parameters(self):   # TODO: check that
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.constant_(self.out_proj.bias, 0.0)
 
-        elif key is value or torch.equal(key, value):
-            # encoder-decoder attention
-            # This is inline in_proj function with in_proj_weight and in_proj_bias
-            _b = in_proj_bias
-            _start = 0
-            _end = embed_dim
-            _w = in_proj_weight[_start:_end, :]
-            if _b is not None:
-                _b = _b[_start:_end]
-            q = linear(query, _w, _b)
+    def forward(self, query, key, value, key_padding_mask=None, attn_mask=None):
+        tgt_len, batch_size, embed_dim = query.size()
+        q = self.q_proj(query) * self.scaling
+        q = q.contiguous().view(tgt_len, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
 
-            if key is None:
-                assert value is None
-                k = None
-                v = None
-            else:
+        k = self.k_proj(key)
+        k = k.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+        v = self.v_proj(value)
+        v = v.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+        
+        src_len = k.size(1)
+        attn_weights = torch.bmm(q, k.transpose(1, 2))
 
-                # This is inline in_proj function with in_proj_weight and in_proj_bias
-                _b = in_proj_bias
-                _start = embed_dim
-                _end = None
-                _w = in_proj_weight[_start:, :]
-                if _b is not None:
-                    _b = _b[_start:]
-                k, v = linear(key, _w, _b).chunk(2, dim=-1)
-
-        else:
-            # This is inline in_proj function with in_proj_weight and in_proj_bias
-            _b = in_proj_bias
-            _start = 0
-            _end = embed_dim
-            _w = in_proj_weight[_start:_end, :]
-            if _b is not None:
-                _b = _b[_start:_end]
-            q = linear(query, _w, _b)
-
-            # This is inline in_proj function with in_proj_weight and in_proj_bias
-            _b = in_proj_bias
-            _start = embed_dim
-            _end = embed_dim * 2
-            _w = in_proj_weight[_start:_end, :]
-            if _b is not None:
-                _b = _b[_start:_end]
-            k = linear(key, _w, _b)
-
-            # This is inline in_proj function with in_proj_weight and in_proj_bias
-            _b = in_proj_bias
-            _start = embed_dim * 2
-            _end = None
-            _w = in_proj_weight[_start:, :]
-            if _b is not None:
-                _b = _b[_start:]
-            v = linear(value, _w, _b)
-    else:
-        q_proj_weight_non_opt = torch.jit._unwrap_optional(q_proj_weight)
-        len1, len2 = q_proj_weight_non_opt.size()
-        assert len1 == embed_dim and len2 == query.size(-1)
-
-        k_proj_weight_non_opt = torch.jit._unwrap_optional(k_proj_weight)
-        len1, len2 = k_proj_weight_non_opt.size()
-        assert len1 == embed_dim and len2 == key.size(-1)
-
-        v_proj_weight_non_opt = torch.jit._unwrap_optional(v_proj_weight)
-        len1, len2 = v_proj_weight_non_opt.size()
-        assert len1 == embed_dim and len2 == value.size(-1)
-
-        if in_proj_bias is not None:
-            q = linear(query, q_proj_weight_non_opt, in_proj_bias[0:embed_dim])
-            k = linear(key, k_proj_weight_non_opt, in_proj_bias[embed_dim : (embed_dim * 2)])
-            v = linear(value, v_proj_weight_non_opt, in_proj_bias[(embed_dim * 2) :])
-        else:
-            q = linear(query, q_proj_weight_non_opt, in_proj_bias)
-            k = linear(key, k_proj_weight_non_opt, in_proj_bias)
-            v = linear(value, v_proj_weight_non_opt, in_proj_bias)
-    q = q * scaling
-
-    if attn_mask is not None:
-        assert (
-            attn_mask.dtype == torch.float32
-            or attn_mask.dtype == torch.float64
-            or attn_mask.dtype == torch.float16
-            or attn_mask.dtype == torch.uint8
-            or attn_mask.dtype == torch.bool
-        ), "Only float, byte, and bool types are supported for attn_mask, not {}".format(attn_mask.dtype)
-        if attn_mask.dtype == torch.uint8:
-            warnings.warn("Byte tensor for attn_mask in nn.MultiheadAttention is deprecated. Use bool tensor instead.")
-            attn_mask = attn_mask.to(torch.bool)
-
-        if attn_mask.dim() == 2:
-            attn_mask = attn_mask.unsqueeze(0)
-            if list(attn_mask.size()) != [1, query.size(0), key.size(0)]:
-                raise RuntimeError("The size of the 2D attn_mask is not correct.")
-        elif attn_mask.dim() == 3:
-            if list(attn_mask.size()) != [bsz * num_heads, query.size(0), key.size(0)]:
-                raise RuntimeError("The size of the 3D attn_mask is not correct.")
-        else:
-            raise RuntimeError("attn_mask's dimension {} is not supported".format(attn_mask.dim()))
-        # attn_mask's dim is 3 now.
-
-    # convert ByteTensor key_padding_mask to bool
-    if key_padding_mask is not None and key_padding_mask.dtype == torch.uint8:
-        warnings.warn(
-            "Byte tensor for key_padding_mask in nn.MultiheadAttention is deprecated. Use bool tensor instead."
-        )
-        key_padding_mask = key_padding_mask.to(torch.bool)
-
-    if bias_k is not None and bias_v is not None:
-        if static_k is None and static_v is None:
-            k = torch.cat([k, bias_k.repeat(1, bsz, 1)])
-            v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
-            if attn_mask is not None:
-                attn_mask = pad(attn_mask, (0, 1))
-            if key_padding_mask is not None:
-                key_padding_mask = pad(key_padding_mask, (0, 1))
-        else:
-            assert static_k is None, "bias cannot be added to static key."
-            assert static_v is None, "bias cannot be added to static value."
-    else:
-        assert bias_k is None
-        assert bias_v is None
-
-    q = q.contiguous().view(tgt_len, bsz * num_heads, head_dim).transpose(0, 1)
-    if k is not None:
-        k = k.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-    if v is not None:
-        v = v.contiguous().view(-1, bsz * num_heads, head_dim).transpose(0, 1)
-
-    if static_k is not None:
-        assert static_k.size(0) == bsz * num_heads
-        assert static_k.size(2) == head_dim
-        k = static_k
-
-    if static_v is not None:
-        assert static_v.size(0) == bsz * num_heads
-        assert static_v.size(2) == head_dim
-        v = static_v
-
-    src_len = k.size(1)
-
-    if key_padding_mask is not None:
-        assert key_padding_mask.size(0) == bsz
-        assert key_padding_mask.size(1) == src_len
-
-    if add_zero_attn:
-        src_len += 1
-        k = torch.cat([k, torch.zeros((k.size(0), 1) + k.size()[2:], dtype=k.dtype, device=k.device)], dim=1)
-        v = torch.cat([v, torch.zeros((v.size(0), 1) + v.size()[2:], dtype=v.dtype, device=v.device)], dim=1)
         if attn_mask is not None:
-            attn_mask = pad(attn_mask, (0, 1))
+            attn_mask = attn_mask.unsqueeze(0)
+            attn_weights.masked_fill_(attn_mask, float("-inf"))
+
         if key_padding_mask is not None:
-            key_padding_mask = pad(key_padding_mask, (0, 1))
+            attn_weights = attn_weights.view(batch_size, self.num_heads, tgt_len, src_len)
+            attn_weights = attn_weights.masked_fill(
+                key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
+                float('-inf'),
+            )
+            attn_weights = attn_weights.view(batch_size * self.num_heads, tgt_len, src_len)
 
-    attn_output_weights = torch.bmm(q, k.transpose(1, 2))
-    assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
+        attn_weights_float = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
+        attn_weights = attn_weights_float.type_as(attn_weights)
+        attn_probs = self.dropout(attn_weights)
 
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_output_weights.masked_fill_(attn_mask, float("-inf"))
-        else:
-            attn_output_weights += attn_mask
+        attn = torch.bmm(attn_probs, v)
+        attn = attn.transpose(0, 1).contiguous().view(tgt_len, batch_size, embed_dim)
+        attn = self.out_proj(attn)
 
-    if key_padding_mask is not None:
-        attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
-        attn_output_weights = attn_output_weights.masked_fill(
-            key_padding_mask.unsqueeze(1).unsqueeze(2),
-            float("-inf"),
-        )
-        attn_output_weights = attn_output_weights.view(bsz * num_heads, tgt_len, src_len)
-
-    attn_output_weights = softmax(attn_output_weights, dim=-1)
-    attn_output_weights = dropout(attn_output_weights, p=dropout_p, training=training)
-
-    attn_output = torch.bmm(attn_output_weights, v)
-    assert list(attn_output.size()) == [bsz * num_heads, tgt_len, head_dim]
-    attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
-    attn_output = linear(attn_output, out_proj_weight, out_proj_bias)
-
-    if need_weights:
-        # average attention weights over heads
-        # AND (monkey patching) also return the non-averaged weights too
-        attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
-        return attn_output, torch.sum(attn_output_weights, dim=1) / num_heads, attn_output_weights
-    else:
-        return attn_output, None, None
-
-
-setattr(F, 'multi_head_attention_forward', alps_multi_head_attention_forward)
+        attn_weights = attn_weights.view(batch_size, self.num_heads, tgt_len, src_len)
+        return attn, torch.sum(attn_weights, dim=1) / self.num_heads, attn_weights
 
 
 class BagOfWords(nn.Module):
@@ -590,7 +338,6 @@ class TransformerEncoder(nn.Module):
             num_layers=1,
             dropout=0,
             heads=4,
-            normalize_before=False,
         ):
         super(TransformerEncoder, self).__init__()
 
@@ -599,7 +346,7 @@ class TransformerEncoder(nn.Module):
         self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=PAD_IDX)
         self.embed_positions = PositionalEncoding(hidden_size)
         self.layers = nn.ModuleList([
-            TransformerEncoderLayer(hidden_size, heads, hidden_size, dropout, normalize_before=normalize_before)
+            TransformerEncoderLayer(hidden_size, heads, hidden_size, dropout)
             for _ in range(num_layers)
         ])
     
@@ -637,7 +384,6 @@ class TransformerDecoder(nn.Module):
             num_layers=1,
             dropout=0,
             heads=4,
-            normalize_before=False,
         ):
         super(TransformerDecoder, self).__init__()
 
@@ -646,7 +392,7 @@ class TransformerDecoder(nn.Module):
         self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
         self.embed_positions = PositionalEncoding(hidden_size)
         self.layers = nn.ModuleList([
-            TransformerDecoderLayer(hidden_size, heads, hidden_size, dropout, normalize_before=normalize_before)
+            TransformerDecoderLayer(hidden_size, heads, hidden_size, dropout)
             for _ in range(num_layers)
         ])
         self.out = nn.Linear(hidden_size, output_size)
@@ -732,14 +478,16 @@ class EncoderDecoder(nn.Module):
         use_cuda=True,
         target_dict=None,
         max_len=50,
-        clip=0.3
+        clip=0.3,
     ):
         super(EncoderDecoder, self).__init__()
 
-        device = torch.device(
-            "cuda" if (torch.cuda.is_available() and use_cuda) else "cpu"
-        )
+        device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
         self.device = device
+        # self.amp = device == 'cuda'
+        self.amp = False
+        self.scaler = torch.cuda.amp.GradScaler(init_scale=2**7, growth_interval=2**14, enabled=self.amp)
+
         self.encoder = encoder.to(device)
         self.decoder = decoder.to(device)
 
@@ -750,29 +498,13 @@ class EncoderDecoder(nn.Module):
 
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
         self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode="max", min_lr=1e-6, patience=0, verbose=True)
+            self.optimizer, mode='max', min_lr=1e-6, patience=0, verbose=True)
         # self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.5, verbose=True)
     
         self.max_len = max_len
         self.clip = clip
         self.START = torch.LongTensor([SOS_IDX]).to(device)
         self.END_IDX = EOS_IDX
-
-    def zero_grad(self):
-        """Zero out optimizer."""
-        self.optimizer.zero_grad()
-
-    def update_params(self):
-        """Do one optimization step."""
-        if self.clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.encoder.parameters(), self.clip)
-            torch.nn.utils.clip_grad_norm_(
-                self.decoder.parameters(), self.clip)
-        self.optimizer.step()
-
-    def scheduler_step(self, val_score=None):
-        self.scheduler.step(val_score)
 
     def vec2txt(self, vector):
         """Convert vector to text.
@@ -830,29 +562,49 @@ class EncoderDecoder(nn.Module):
         self.encoder.train()
         self.decoder.train()
 
-        encoder_results = self.encoder(xs, xs_len=xs_len, lang=source_lang)
-        encoder_output = encoder_results['encoder_output']
-        encoder_hidden = encoder_results['encoder_hidden']
+        with torch.autocast(self.device, enabled=self.amp):
+            encoder_results = self.encoder(xs, xs_len=xs_len, lang=source_lang)
+            encoder_output = encoder_results['encoder_output']
+            encoder_hidden = encoder_results['encoder_hidden']
 
-        # Teacher forcing: Feed the target as the next input
-        y_in = ys.narrow(1, 0, ys.size(1) - 1)
-        decoder_input = torch.cat([starts, y_in], 1)
+            # Teacher forcing: Feed the target as the next input
+            y_in = ys.narrow(1, 0, ys.size(1) - 1)
+            decoder_input = torch.cat([starts, y_in], 1)
 
-        decoder_results = self.decoder(
-            decoder_input,
-            encoder_hidden,
-            encoder_output,
-            xs_len,
-            lang=target_lang
-        )
-        decoder_output = decoder_results['decoder_output']
-
-        scores = decoder_output.view(-1, decoder_output.size(-1))
-        loss = self.criterion(scores, ys.view(-1)) / ys_len.sum()
-        loss.backward()
+            decoder_results = self.decoder(
+                decoder_input,
+                encoder_hidden,
+                encoder_output,
+                xs_len,
+                lang=target_lang
+            )
+            decoder_output = decoder_results['decoder_output']
+            scores = decoder_output.view(-1, decoder_output.size(-1))
+            loss = self.criterion(scores, ys.view(-1)) / ys_len.sum()
+        
+        
+        self.scaler.scale(loss).backward()
         self.update_params()
 
         return loss.item()
+
+    def zero_grad(self):
+        """Zero out optimizer."""
+        self.optimizer.zero_grad()
+
+    def update_params(self):
+        """Do one optimization step."""
+        if self.clip is not None:
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                self.encoder.parameters(), self.clip)
+            torch.nn.utils.clip_grad_norm_(
+                self.decoder.parameters(), self.clip)
+        self.scaler.step(self.optimizer)
+        self.scaler.update()
+
+    def scheduler_step(self, val_score=None):
+        self.scheduler.step(val_score)
 
     def eval_step(self, batch):
         xs, xs_len = batch['source'], batch['source_len']
@@ -883,7 +635,7 @@ class EncoderDecoder(nn.Module):
         attn_wts_list = []
         context_vec = None
 
-        for i in range(self.max_len):
+        for _ in range(self.max_len):
             # generate at most max_len tokens
 
             decoder_results = self.decoder(
@@ -895,7 +647,7 @@ class EncoderDecoder(nn.Module):
             attn_wts = decoder_results['attention_weights']
             context_vec = decoder_results['context_vector']
 
-            _max_score, preds = decoder_output.max(2)
+            _, preds = decoder_output.max(2)
             predictions.append(preds)
             decoder_input = preds  # set input to next step
 
@@ -937,71 +689,78 @@ class EncoderDecoder(nn.Module):
         }
         torch.save(ckpt, path)
 
+    @property
+    def epoch(self):
+        return self.scheduler.last_epoch
 
-class TransformerEncoderLayer(nn.TransformerEncoderLayer):
-    def __init__(self, *args, normalize_before=False, **kwargs):
-        super(TransformerEncoderLayer, self).__init__(*args, **kwargs)
-        self.normalize_before = normalize_before
 
+class TransformerEncoderLayer(nn.Module):
+    def __init__(self, hidden_size, num_heads, ffn_dim, dropout=0, activation=F.relu):
+        super(TransformerEncoderLayer, self).__init__()
+        self.self_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
+        self.linear1 = nn.Linear(hidden_size, ffn_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(ffn_dim, hidden_size)
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.activation = activation
+    
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         x = src
         residual = x
-        if self.normalize_before:
-            x = self.norm1(x)
         x, _, self_attn_weights_all_heads = self.self_attn(
             x, x, x, attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask)
         x = residual + self.dropout1(x)
-        if not self.normalize_before:
-            x = self.norm1(x)
-
+        x = self.norm1(x)
         residual = x
-        if self.normalize_before:
-            x = self.norm2(x)
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         x = residual + self.dropout2(x)
-        if not self.normalize_before:
-            x = self.norm2(x)
+        x = self.norm2(x)
         return x, self_attn_weights_all_heads
 
 
-class TransformerDecoderLayer(nn.TransformerDecoderLayer):
-    def __init__(self, *args, normalize_before=False, **kwargs):
-        super(TransformerDecoderLayer, self).__init__(*args, **kwargs)
-        self.normalize_before = normalize_before
+class TransformerDecoderLayer(nn.Module):
+    def __init__(self, hidden_size, num_heads, ffn_dim, dropout=0, activation=F.relu):
+        super(TransformerDecoderLayer, self).__init__()
+        self.self_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
+        self.multihead_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
+        self.linear1 = nn.Linear(hidden_size, ffn_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(ffn_dim, hidden_size)
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.norm3 = nn.LayerNorm(hidden_size)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+        self.activation = activation
 
     def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
                 tgt_key_padding_mask=None, memory_key_padding_mask=None, prev_states=None):
         x = tgt
         residual = x
-        if self.normalize_before:
-            x = self.norm1(x)
         if prev_states is None:
             prev_states = x
         x, _, self_attn_weights_all_heads = self.self_attn(
             x, prev_states, prev_states, attn_mask=tgt_mask,
             key_padding_mask=tgt_key_padding_mask)
         x = residual + self.dropout1(x)
-        if not self.normalize_before:
-            x = self.norm1(x)
+        x = self.norm1(x)
 
         residual = x
-        if self.normalize_before:
-            x = self.norm2(x)
         x, attn_weights, attn_weights_all_heads = self.multihead_attn(
             x, memory, memory, attn_mask=memory_mask,
             key_padding_mask=memory_key_padding_mask)
         x = residual + self.dropout2(x)
-        if not self.normalize_before:
-            x = self.norm2(x)
+        x = self.norm2(x)
 
         residual = x
-        if self.normalize_before:
-            x = self.norm3(x)
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))
         x = residual + self.dropout3(x)
-        if not self.normalize_before:
-            x = self.norm3(x)
+        x = self.norm3(x)
 
         return x, self_attn_weights_all_heads, attn_weights
 

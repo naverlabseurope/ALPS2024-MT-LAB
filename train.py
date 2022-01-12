@@ -2,9 +2,8 @@
 
 import os
 import sys
-sys.path.append('pyfiles')
-import nmt_dataset
-import nnet_models
+import models
+import data
 import numpy as np
 import torch
 import time
@@ -15,6 +14,7 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument('checkpoint_path', help='Path to the output model checkpoint (e.g., models/my_model.pt)')
+parser.add_argument('--reset', action='store_true', help='if the checkpoint already exists, reset it instead of resuming training')
 parser.add_argument('-s', '--source-lang', default='en', metavar='SRC', help='Source language (e.g., en)')
 parser.add_argument('-t', '--target-lang', default='fr', metavar='TGT', help='Target language (e.g., fr)')
 parser.add_argument('--lang-pairs', nargs='+',
@@ -24,6 +24,7 @@ parser.add_argument('--lang-pairs', nargs='+',
 parser.add_argument('--source-dict', help='Path to the source dictionary. Default: dict.SRC.txt in the same directory as the checkpoint')
 parser.add_argument('--target-dict', help='Path to the target dictionary. Default: dict.TGT.txt in the same directory as the checkpoint')
 parser.add_argument('--bpecodes', help='Path to the BPE model. Default: DATA_DIR/bpecodes.de-en-fr')
+# parser.add_argument('--spm-path', help='Path to the SentencePiece model. Default: DATA_DIR/spm.de-en-fr.model')
 parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs. Default: 10')
 parser.add_argument('--num-layers', type=int, default=1, help='Number of Transformer encoder and decoder layers. Default: 1')
 parser.add_argument('--hidden-size', type=int, default=512, help='Hidden size and embedding size of the Transformer model. Default: 512')
@@ -39,7 +40,6 @@ parser.add_argument('--shared-embeddings', action='store_true',
                     help='Use the same joint dictionary on the source and target side, '
                     ' and share the encoder and decoder embedding matrices')
 
-
 args = parser.parse_args()
 
 data_dir = args.data_dir
@@ -49,6 +49,7 @@ epochs = args.epochs
 num_layers = args.num_layers
 hidden_size = args.hidden_size
 bpe_path = args.bpecodes or os.path.join(data_dir, 'bpecodes.de-en-fr')
+# spm_path = args.spm_path or os.path.join(data_dir, 'spm.de-en-fr.model')
 max_size = args.max_size
 minimum_count = 10
 max_len = 30       # maximum 30 tokens per sentence (longer sequences will be truncated)
@@ -84,17 +85,27 @@ with open(bpe_path) as bpe_codes:
 
 def preprocess(line, is_source=True, source_lang=None, target_lang=None):
     line = bpe_model.segment(line.lower())
-    if len(target_langs) > 1:
+    if len(target_langs) > 1 and is_source:
         line = f'<lang:{target_lang}> {line}'
     return line
+
+# spm = spm.SentencePieceProcessor(model_file=spm_path)
+
+# def preprocess(line, is_source=True, source_lang=None, target_lang=None):
+#     line = line.strip()
+#     if line:
+#         line = ' '.join(spm.encode_as_pieces(line.lower()))
+#     if len(target_langs) > 1 and is_source:
+#         line = f'<lang:{target_lang}> {line}'
+#     return line
 
 def postprocess(line):
     return line.replace('@@ ', '')
 
 def load_data(source_lang, target_lang, split='train', max_size=None):
     # max_size: max number of sentence pairs in the training corpus (None = all)
-    path = os.path.join(data_dir, '{}.{}-{}'.format(split, *sorted([source_lang, target_lang])))
-    return nmt_dataset.load_dataset(path, source_lang, target_lang, preprocess=preprocess, max_size=max_size)
+    path = os.path.join(data_dir, f'{split}.{source_lang}-{target_lang}')
+    return data.load_dataset(path, source_lang, target_lang, preprocess=preprocess, max_size=max_size)
 
 
 train_data = {}
@@ -116,18 +127,18 @@ if shared_embeddings:
     target_data = source_data
 
 
-source_dict = nmt_dataset.load_or_create_dictionary(
+source_dict = data.load_or_create_dictionary(
     source_dict_path,
     source_data,
     minimum_count=minimum_count,
-    reset=True
+    reset=False,
 )
 
-target_dict = nmt_dataset.load_or_create_dictionary(
+target_dict = data.load_or_create_dictionary(
     target_dict_path,
     target_data,
     minimum_count=minimum_count,
-    reset=True
+    reset=False,
 )
 
 print('source vocab size:', len(source_dict))
@@ -138,8 +149,8 @@ valid_iterators = []
 
 for lang_pair in lang_pairs:
     src, tgt = lang_pair
-    nmt_dataset.binarize(train_data[lang_pair], source_dict, target_dict, sort=True)
-    nmt_dataset.binarize(valid_data[lang_pair], source_dict, target_dict, sort=False)
+    data.binarize(train_data[lang_pair], source_dict, target_dict, sort=True)
+    data.binarize(valid_data[lang_pair], source_dict, target_dict, sort=False)
 
     print('{}-{}: train_size={}, valid_size={}, min_len={}, max_len={}'.format(
         src,
@@ -152,13 +163,13 @@ for lang_pair in lang_pairs:
 
     reset_seed()
 
-    train_iterator = nmt_dataset.BatchIterator(train_data[lang_pair], src, tgt, batch_size=batch_size, max_len=max_len, shuffle=True)
+    train_iterator = data.BatchIterator(train_data[lang_pair], src, tgt, batch_size=batch_size, max_len=max_len, shuffle=True)
     train_iterators.append(train_iterator)
-    valid_iterator = nmt_dataset.BatchIterator(valid_data[lang_pair], src, tgt, batch_size=batch_size, max_len=max_len, shuffle=False)
+    valid_iterator = data.BatchIterator(valid_data[lang_pair], src, tgt, batch_size=batch_size, max_len=max_len, shuffle=False)
     valid_iterators.append(valid_iterator)
 
 if len(train_iterator) > 1:
-    train_iterator = nmt_dataset.MultilingualBatchIterator(train_iterators)
+    train_iterator = data.MultilingualBatchIterator(train_iterators)
 else:
     train_iterator = train_iterators[0]
 
@@ -172,9 +183,9 @@ def train_model(
         validation_frequency=1
     ):
     """
-    train_iterator: instance of nmt_dataset.BatchIterator or nmt_dataset.MultiBatchIterator
-    valid_iterators: list of nmt_dataset.BatchIterator
-    model: instance of nnet_models.EncoderDecoder
+    train_iterator: instance of data.BatchIterator or data.MultiBatchIterator
+    valid_iterators: list of data.BatchIterator
+    model: instance of models.EncoderDecoder
     checkpoint_path: path of the model checkpoint
     epochs: iterate this many times over train_iterator
     validation_frequency: validate the model every N epochs
@@ -183,12 +194,13 @@ def train_model(
     reset_seed()
 
     best_score = -1
-    for epoch in range(1, epochs + 1):
+    # for epoch in range(1, epochs + 1):
+    for epoch in range(model.epoch + 1, epochs + 1):
 
         start = time.time()
         running_loss = 0
 
-        print(f'Epoch: [{epoch}/{epochs}]')
+        print(f'Epoch [{epoch}/{epochs}]')
 
         # Iterate over training batches for one epoch
         for i, batch in enumerate(train_iterator, 1):
@@ -250,14 +262,14 @@ def train_model(
     print(f'Training completed. Best chrF is {best_score}')
 
 
-encoder = nnet_models.TransformerEncoder(
+encoder = models.TransformerEncoder(
     input_size=len(source_dict),
     hidden_size=hidden_size,
     num_layers=num_layers,
     dropout=dropout,
     heads=attention_heads
 )
-decoder = nnet_models.TransformerDecoder(
+decoder = models.TransformerDecoder(
     output_size=len(target_dict),
     hidden_size=hidden_size,
     num_layers=num_layers,
@@ -267,7 +279,7 @@ decoder = nnet_models.TransformerDecoder(
 if shared_embeddings:
     decoder.embedding = encoder.embedding
 
-model = nnet_models.EncoderDecoder(
+model = models.EncoderDecoder(
     encoder,
     decoder,
     lr=learning_rate,
@@ -275,8 +287,14 @@ model = nnet_models.EncoderDecoder(
     target_dict=target_dict
 )
 
-print('checkpoint path:', checkpoint_path)
+if not args.reset:
+    model.load(checkpoint_path)
 
-train_model(train_iterator, valid_iterators, model,
-            epochs=epochs,
-            checkpoint_path=checkpoint_path)
+print(f'checkpoint path: {checkpoint_path} @{model.epoch}')
+
+try:
+    train_model(train_iterator, valid_iterators, model,
+                epochs=epochs,
+                checkpoint_path=checkpoint_path)
+except KeyboardInterrupt:
+    print('training interrupted')
