@@ -33,7 +33,7 @@ parser.add_argument('--max-size', type=int, help='Maximum number of training exa
 parser.add_argument('--max-len', type=int, default=30, help='Maximum number of tokens per line (longer sequences will be truncated). Default: 30')
 parser.add_argument('--data-dir', default='data', metavar='DATA_DIR', help='Directory containing the training data. Default: data')
 parser.add_argument('--dropout', type=float, default=0, help='Dropout rate. Default: 0')
-parser.add_argument('--lr', type=float, default=0.001, help='Learning rate. Default: 0.001')
+parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate. Default: 0.0005')
 parser.add_argument('--heads', type=int, default=4, help='Number of attention heads. Default: 4')
 parser.add_argument('--batch-size', type=int, default=512, help='Maximum number of tokens in a batch. Default: 512')
 parser.add_argument('--cpu', action='store_true', help='Train on CPU')
@@ -231,10 +231,12 @@ def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=
         evaluate_model(valid_iterators, model, record=False)
         return
     
+    start = time.time()
+
     best_score = -1
     for epoch in range(model.epoch + 1, epochs + 1):
 
-        start = time.time()
+        start_ = time.time()
         running_loss = 0
 
         print(f'Epoch [{epoch}/{epochs}]')
@@ -246,7 +248,7 @@ def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=
                     "\r{}/{}, wall={:.2f}, loss={:.3f}".format(
                         i,
                         len(train_iterator),
-                        time.time() - start,
+                        time.time() - start_,
                         running_loss / i,
                     )
                 )
@@ -258,7 +260,7 @@ def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=
         # Average training loss for this epoch
         epoch_loss = running_loss / len(train_iterator)
 
-        print(f"loss={epoch_loss:.3f}, time={time.time() - start:.2f}")
+        print(f"loss={epoch_loss:.3f}, time={time.time() - start_:.2f}")
         model.record('train_loss', epoch_loss)
 
         score = evaluate_model(valid_iterators, model, record=True)
@@ -274,7 +276,7 @@ def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=
 
         print('=' * 50, flush=True)
 
-    print(f'Training completed. Best chrF is {best_score:.2f}')
+    print(f'Training completed. Best chrF is {best_score:.2f}. Total time: {time.time() - start:.2f}')
 
 
 encoder_args = dict(
@@ -294,9 +296,11 @@ if args.model_type == 'bow':
     encoder = models.BOW_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 elif args.model_type == 'rnn':
+    assert args.encoder_layers == args.decoder_layers
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 elif args.model_type == 'rnn_attn':
+    assert args.decoder_layers == 1
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.AttentionDecoder(**decoder_args)
 else:
