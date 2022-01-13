@@ -39,6 +39,8 @@ parser.add_argument('-v', '--verbose', action='store_true', help='Show training 
 parser.add_argument('--shared-embeddings', action='store_true',
                     help='Use the same joint dictionary on the source and target side, '
                     ' and share the encoder and decoder embedding matrices')
+parser.add_argument('--model-type', choices=['bow', 'rnn', 'rnn_attn', 'transformer'], default='transformer',
+                    help='which model architecture to use')
 
 args = parser.parse_args()
 
@@ -69,10 +71,17 @@ if len(lang_pairs) == 1:
     source_lang, target_lang = lang_pairs[0]
 else:
     source_lang, target_lang = 'src', 'tgt'
+lang_pairs.sort()
 source_langs = set(src for src, _ in lang_pairs)
 target_langs = set(tgt for _, tgt in lang_pairs)
-source_dict_path = args.source_dict or os.path.join(model_dir, f'dict.{source_lang}.txt')
-target_dict_path = args.target_dict or os.path.join(model_dir, f'dict.{target_lang}.txt')
+source_dict_path = (
+    args.source_dict or
+    os.path.join(model_dir, 'dict.txt' if args.shared_embeddings else f'dict.{source_lang}.txt')
+)
+target_dict_path = (
+    args.target_dict or
+    os.path.join(model_dir, 'dict.txt' if args.shared_embeddings else f'dict.{target_lang}.txt')
+)
 shared_embeddings = args.shared_embeddings
 
 
@@ -121,25 +130,26 @@ for lang_pair in lang_pairs:
     source_data += list(train_data[lang_pair]['source_tokenized'])
     target_data += list(train_data[lang_pair]['target_tokenized'])
 
-
 if shared_embeddings:
     source_data += target_data
-    target_data = source_data
 
 
 source_dict = data.load_or_create_dictionary(
     source_dict_path,
     source_data,
     minimum_count=minimum_count,
-    reset=False,
+    reset=args.reset,
 )
 
-target_dict = data.load_or_create_dictionary(
-    target_dict_path,
-    target_data,
-    minimum_count=minimum_count,
-    reset=False,
-)
+if shared_embeddings:
+    target_dict = source_dict    
+else:
+    target_dict = data.load_or_create_dictionary(
+        target_dict_path,
+        target_data,
+        minimum_count=minimum_count,
+        reset=args.reset,
+    )
 
 print('source vocab size:', len(source_dict))
 print('target vocab size:', len(target_dict))
@@ -262,20 +272,32 @@ def train_model(
     print(f'Training completed. Best chrF is {best_score}')
 
 
-encoder = models.TransformerEncoder(
+encoder_args = dict(
     input_size=len(source_dict),
     hidden_size=hidden_size,
     num_layers=num_layers,
     dropout=dropout,
-    heads=attention_heads
 )
-decoder = models.TransformerDecoder(
+decoder_args = dict(
     output_size=len(target_dict),
     hidden_size=hidden_size,
     num_layers=num_layers,
     dropout=dropout,
-    heads=attention_heads
 )
+
+if args.model_type == 'bow':
+    encoder = models.BagOfWords(**encoder_args)
+    decoder = models.RNN_Decoder(**decoder_args)
+elif args.model_type == 'rnn':
+    encoder = models.RNN_Encoder(**encoder_args)
+    decoder = models.RNN_Decoder(**decoder_args)
+elif args.model_type == 'rnn_attn':
+    encoder = models.RNN_Encoder(**encoder_args)
+    decoder = models.AttentionDecoder(**decoder_args)
+else:
+    encoder = models.TransformerEncoder(**encoder_args, heads=attention_heads)
+    decoder = models.TransformerDecoder(**decoder_args, heads=attention_heads)
+
 if shared_embeddings:
     decoder.embedding = encoder.embedding
 

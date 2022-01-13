@@ -180,6 +180,8 @@ class BatchIterator:
 
 class MultilingualBatchIterator(BatchIterator):
     def __init__(self, iterators, shuffle=True):
+        # Note that this builds homogeneous batches (all examples in a given batch are from the same language pair)
+        # Heterogeneous batches might give better results
         self.iterators = iterators
         self.batches = sum((iterator.batches for iterator in iterators), [])
         self.shuffle = shuffle
