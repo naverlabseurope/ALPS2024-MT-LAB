@@ -26,9 +26,11 @@ parser.add_argument('--target-dict', help='Path to the target dictionary. Defaul
 parser.add_argument('--bpecodes', help='Path to the BPE model. Default: DATA_DIR/bpecodes.de-en-fr')
 # parser.add_argument('--spm-path', help='Path to the SentencePiece model. Default: DATA_DIR/spm.de-en-fr.model')
 parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs. Default: 10')
-parser.add_argument('--num-layers', type=int, default=1, help='Number of Transformer encoder and decoder layers. Default: 1')
-parser.add_argument('--hidden-size', type=int, default=512, help='Hidden size and embedding size of the Transformer model. Default: 512')
+parser.add_argument('--encoder-layers', type=int, default=1, help='Number of encoder layers. Default: 1')
+parser.add_argument('--decoder-layers', type=int, default=1, help='Number of decoder layers. Default: 1')
+parser.add_argument('--hidden-size', type=int, default=512, help='Hidden size and embedding size of the model. Default: 512')
 parser.add_argument('--max-size', type=int, help='Maximum number of training examples. Default: all')
+parser.add_argument('--max-len', type=int, default=30, help='Maximum number of tokens per line (longer sequences will be truncated). Default: 30')
 parser.add_argument('--data-dir', default='data', metavar='DATA_DIR', help='Directory containing the training data. Default: data')
 parser.add_argument('--dropout', type=float, default=0, help='Dropout rate. Default: 0')
 parser.add_argument('--lr', type=float, default=0.001, help='Learning rate. Default: 0.001')
@@ -44,36 +46,25 @@ parser.add_argument('--model-type', choices=['bow', 'rnn', 'rnn_attn', 'transfor
 
 args = parser.parse_args()
 
-data_dir = args.data_dir
 model_dir = os.path.dirname(args.checkpoint_path)
-checkpoint_path = args.checkpoint_path
-epochs = args.epochs
-num_layers = args.num_layers
-hidden_size = args.hidden_size
-bpe_path = args.bpecodes or os.path.join(data_dir, 'bpecodes.de-en-fr')
-# spm_path = args.spm_path or os.path.join(data_dir, 'spm.de-en-fr.model')
-max_size = args.max_size
-minimum_count = 10
-max_len = 30       # maximum 30 tokens per sentence (longer sequences will be truncated)
-batch_size = args.batch_size
-hidden_size = args.hidden_size
-num_layers = args.num_layers
-dropout = args.dropout
-learning_rate = args.lr
-attention_heads = args.heads
-cpu = args.cpu
-verbose = args.verbose
+bpe_path = args.bpecodes or os.path.join(args.data_dir, 'bpecodes.de-en-fr')
+# spm_path = args.spm_path or os.path.join(args.data_dir, 'spm.de-en-fr.model')
+
 if args.lang_pairs:
     lang_pairs = [tuple(lang_pair.split('-')) for lang_pair in args.lang_pairs]
 else:
     lang_pairs = [(args.source_lang, args.target_lang)]
+
 if len(lang_pairs) == 1:
     source_lang, target_lang = lang_pairs[0]
 else:
     source_lang, target_lang = 'src', 'tgt'
+
 lang_pairs.sort()
+
 source_langs = set(src for src, _ in lang_pairs)
 target_langs = set(tgt for _, tgt in lang_pairs)
+
 source_dict_path = (
     args.source_dict or
     os.path.join(model_dir, 'dict.txt' if args.shared_embeddings else f'dict.{source_lang}.txt')
@@ -82,7 +73,6 @@ target_dict_path = (
     args.target_dict or
     os.path.join(model_dir, 'dict.txt' if args.shared_embeddings else f'dict.{target_lang}.txt')
 )
-shared_embeddings = args.shared_embeddings
 
 
 def reset_seed(seed=1234):
@@ -113,7 +103,7 @@ def postprocess(line):
 
 def load_data(source_lang, target_lang, split='train', max_size=None):
     # max_size: max number of sentence pairs in the training corpus (None = all)
-    path = os.path.join(data_dir, f'{split}.{source_lang}-{target_lang}')
+    path = os.path.join(args.data_dir, f'{split}.{source_lang}-{target_lang}')
     return data.load_dataset(path, source_lang, target_lang, preprocess=preprocess, max_size=max_size)
 
 
@@ -125,29 +115,27 @@ target_data = []
 
 for lang_pair in lang_pairs:
     src, tgt = lang_pair
-    train_data[lang_pair] = load_data(src, tgt, 'train', max_size=max_size)   # set max_size to 10000 for fast debugging
+    train_data[lang_pair] = load_data(src, tgt, 'train', max_size=args.max_size)   # set max_size to 10000 for fast debugging
     valid_data[lang_pair] = load_data(src, tgt, 'valid')
     source_data += list(train_data[lang_pair]['source_tokenized'])
     target_data += list(train_data[lang_pair]['target_tokenized'])
 
-if shared_embeddings:
+if args.shared_embeddings:
     source_data += target_data
 
 
 source_dict = data.load_or_create_dictionary(
     source_dict_path,
     source_data,
-    minimum_count=minimum_count,
     reset=args.reset,
 )
 
-if shared_embeddings:
+if args.shared_embeddings:
     target_dict = source_dict    
 else:
     target_dict = data.load_or_create_dictionary(
         target_dict_path,
         target_data,
-        minimum_count=minimum_count,
         reset=args.reset,
     )
 
@@ -173,9 +161,9 @@ for lang_pair in lang_pairs:
 
     reset_seed()
 
-    train_iterator = data.BatchIterator(train_data[lang_pair], src, tgt, batch_size=batch_size, max_len=max_len, shuffle=True)
+    train_iterator = data.BatchIterator(train_data[lang_pair], src, tgt, batch_size=args.batch_size, max_len=args.max_len, shuffle=True)
     train_iterators.append(train_iterator)
-    valid_iterator = data.BatchIterator(valid_data[lang_pair], src, tgt, batch_size=batch_size, max_len=max_len, shuffle=False)
+    valid_iterator = data.BatchIterator(valid_data[lang_pair], src, tgt, batch_size=args.batch_size, max_len=args.max_len, shuffle=False)
     valid_iterators.append(valid_iterator)
 
 if len(train_iterator) > 1:
@@ -215,7 +203,7 @@ def train_model(
         # Iterate over training batches for one epoch
         for i, batch in enumerate(train_iterator, 1):
             t = time.time()
-            if verbose:
+            if args.verbose:
                 sys.stdout.write(
                     "\r{}/{}, wall={:.2f}, loss={:.3f}".format(
                         i,
@@ -226,7 +214,7 @@ def train_model(
                 )
             running_loss += model.train_step(batch)
 
-        if verbose:
+        if args.verbose:
             print()
 
         # Average training loss for this epoch
@@ -242,6 +230,9 @@ def train_model(
             # Compute chrF over all validation sets
             for valid_iterator in valid_iterators:
                 src, tgt = valid_iterator.source_lang, valid_iterator.target_lang
+                valid_loss = 0
+                for batch in valid_iterator:
+                    valid_loss += model.eval_step(batch) / len(valid_iterator)
                 translation_output = model.translate(valid_iterator, postprocess)
                 score = translation_output.score
                 output = translation_output.output
@@ -249,14 +240,14 @@ def train_model(
                 with open(os.path.join(model_dir, f'valid.{src}-{tgt}.{epoch}.out'), 'w') as f:
                     f.writelines(line + '\n' for line in output)
 
-                print(f'{src}-{tgt}: chrF={score}')
+                print(f'{src}-{tgt}: loss={valid_loss:.3f}, chrF={score:.2f}')
                 sys.stdout.flush()
                 scores.append(score)
 
             # Average the validation chrF scores
             score = round(sum(scores) / len(scores), 2)
             if len(scores) > 1:
-                print(f'chrF={score}')
+                print(f'chrF={score:.2f}')
 
             # Update the model's learning rate based on current performance.
             # This scheduler divides the learning rate by 10 if chrF does not improve.
@@ -269,20 +260,20 @@ def train_model(
 
         print('=' * 50)
 
-    print(f'Training completed. Best chrF is {best_score}')
+    print(f'Training completed. Best chrF is {best_score:.2f}')
 
 
 encoder_args = dict(
     input_size=len(source_dict),
-    hidden_size=hidden_size,
-    num_layers=num_layers,
-    dropout=dropout,
+    hidden_size=args.hidden_size,
+    num_layers=args.encoder_layers,
+    dropout=args.dropout,
 )
 decoder_args = dict(
     output_size=len(target_dict),
-    hidden_size=hidden_size,
-    num_layers=num_layers,
-    dropout=dropout,
+    hidden_size=args.hidden_size,
+    num_layers=args.decoder_layers,
+    dropout=args.dropout,
 )
 
 if args.model_type == 'bow':
@@ -295,28 +286,28 @@ elif args.model_type == 'rnn_attn':
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.AttentionDecoder(**decoder_args)
 else:
-    encoder = models.TransformerEncoder(**encoder_args, heads=attention_heads)
-    decoder = models.TransformerDecoder(**decoder_args, heads=attention_heads)
+    encoder = models.TransformerEncoder(**encoder_args, heads=args.heads)
+    decoder = models.TransformerDecoder(**decoder_args, heads=args.heads)
 
-if shared_embeddings:
+if args.shared_embeddings:
     decoder.embedding = encoder.embedding
 
 model = models.EncoderDecoder(
     encoder,
     decoder,
-    lr=learning_rate,
-    use_cuda=not cpu,
+    lr=args.lr,
+    use_cuda=not args.cpu,
     target_dict=target_dict
 )
 
 if not args.reset:
-    model.load(checkpoint_path)
+    model.load(args.checkpoint_path)
 
-print(f'checkpoint path: {checkpoint_path} @{model.epoch}')
+print(f'checkpoint path: {args.checkpoint_path} @{model.epoch}')
 
 try:
     train_model(train_iterator, valid_iterators, model,
-                epochs=epochs,
-                checkpoint_path=checkpoint_path)
+                epochs=args.epochs,
+                checkpoint_path=args.checkpoint_path)
 except KeyboardInterrupt:
     print('training interrupted')

@@ -91,7 +91,7 @@ def binarize(dataset, source_dict, target_dict, sort=True):
         dataset.sort_values(by=['source_len', 'target_len'], inplace=True, kind='mergesort')
 
 
-def load_or_create_dictionary(dict_path, dataset, minimum_count=1, reset=False):
+def load_or_create_dictionary(dict_path, dataset, minimum_count=10, reset=False):
     if not reset and os.path.isfile(dict_path):
         dictionary = Dictionary.load(dict_path, minimum_count)
     else:
@@ -141,9 +141,13 @@ class BatchIterator:
         
         size = 0
         for idx in range(len(data)):
-            sample = (data.iloc[idx]['source_bin'], data.iloc[idx]['target_bin'])
+            sample = {
+                'source': data.iloc[idx]['source_bin'],
+                'target': data.iloc[idx]['target_bin'],
+                'reference': data.iloc[idx]['target_data'],
+            }
 
-            sample_size = max(len(sample[0]), len(sample[1]))
+            sample_size = max(len(sample['source']), len(sample['target']))
 
             if sample_size > batch_size:
                 continue
@@ -190,8 +194,11 @@ class MultilingualBatchIterator(BatchIterator):
 
 
 def collate(batch, max_len, source_lang, target_lang):
-    max_source_len = min(max(len(source) for source, _ in batch), max_len)
-    max_target_len = min(max(len(target) for _, target in batch), max_len)
+    source = [sample['source'] for sample in batch]
+    target = [sample['target'] for sample in batch]
+    reference = [sample['reference'] for sample in batch]
+    max_source_len = min(max(map(len, source)), max_len)
+    max_target_len = min(max(map(len, target)), max_len)
 
     def pad(seq, max_len):
         seq = np.array(seq)[:max_len]
@@ -204,14 +211,15 @@ def collate(batch, max_len, source_lang, target_lang):
             )
         return seq, seq_len
 
-    source, source_len = zip(*[pad(source, max_source_len) for source, _ in batch])
-    target, target_len = zip(*[pad(target, max_target_len) for _, target in batch])
-    
+    source, source_len = zip(*[pad(x, max_source_len) for x in source])
+    target, target_len = zip(*[pad(x, max_target_len) for x in target])
+
     return {
         'source': np.array(source),
         'target': np.array(target),
         'source_len': np.array(source_len),
         'target_len': np.array(target_len),
         'source_lang': source_lang,
-        'target_lang': target_lang
+        'target_lang': target_lang,
+        'reference': reference,
     }

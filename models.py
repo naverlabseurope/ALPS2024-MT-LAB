@@ -126,7 +126,7 @@ class BagOfWords(nn.Module):
 class RNN_Encoder(nn.Module):
     """Encodes the input context."""
 
-    def __init__(self, input_size, hidden_size, num_layers, dropout=0, **kwargs):
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0, **kwargs):
         """Initialize encoder.
         :param input_size: size of embedding
         :param hidden_size: size of GRU hidden layers
@@ -235,18 +235,12 @@ class AttentionModule(nn.Module):
         attn_scores = F.softmax(masked_att, dim=0)
         x = (
             attn_scores.unsqueeze(2) *
-            encoder_outs.transpose(
-                0,
-                1)).sum(
-            dim=0)
+            encoder_outs.transpose(0, 1)
+        ).sum(dim=0)
         x = torch.tanh(self.l2(torch.cat((x, hidden), dim=1)))
         return x, attn_scores
 
-    def sequence_mask(
-            self,
-            sequence_length,
-            max_len,
-            device):
+    def sequence_mask(self, sequence_length, max_len, device):
         if max_len is None:
             max_len = sequence_length.max().item()
         batch_size = sequence_length.size(0)
@@ -259,12 +253,7 @@ class AttentionModule(nn.Module):
 
 
 class AttentionDecoder(nn.Module):
-    def __init__(
-            self,
-            output_size,
-            hidden_size,
-            **kwargs,
-        ):
+    def __init__(self, output_size, hidden_size, **kwargs):
         super(AttentionDecoder, self).__init__()
 
         self.output_size = output_size
@@ -531,22 +520,21 @@ class EncoderDecoder(nn.Module):
         )
 
     def translate(self, batch_iterator, detokenize=None):
-        predicted_list = []
-        real_list = []
+        hypotheses = []
+        references = []
 
         for data in batch_iterator:
-            predicted_list += self.eval_step(data)[0]
-            real_list += self.vec2txt(data['target'])
+            hypotheses += self.decoding_step(data)[0]
+            references += data['reference']
 
         if detokenize is not None:
-            predicted_list = [detokenize(line) for line in predicted_list]
-            real_list = [detokenize(line) for line in real_list]
+            hypotheses = [detokenize(line) for line in hypotheses]
 
-        chrf = sacrebleu.corpus_chrf(predicted_list, [real_list])
+        chrf = sacrebleu.corpus_chrf(hypotheses, [references])
         translation_output = namedtuple('translation_output', ['score', 'output'])
-        return translation_output(round(chrf.score, 2), predicted_list)
+        return translation_output(round(chrf.score, 2), hypotheses)
 
-    def train_step(self, batch):
+    def train_step(self, batch, train=True):
         xs, xs_len, ys, ys_len = batch['source'], batch['source_len'], batch['target'], batch['target_len']
         source_lang, target_lang = batch['source_lang'], batch['target_lang']
 
@@ -561,9 +549,13 @@ class EncoderDecoder(nn.Module):
         bsz = xs.size(0)
         starts = self.START.expand(bsz, 1)
         loss = 0
-        self.zero_grad()
-        self.encoder.train()
-        self.decoder.train()
+        if train:
+            self.zero_grad()
+            self.encoder.train()
+            self.decoder.train()
+        else:
+            self.encoder.eval()
+            self.decoder.eval()
 
         with torch.autocast(self.device, enabled=self.amp):
             encoder_results = self.encoder(xs, xs_len=xs_len, lang=source_lang)
@@ -585,11 +577,14 @@ class EncoderDecoder(nn.Module):
             scores = decoder_output.view(-1, decoder_output.size(-1))
             loss = self.criterion(scores, ys.view(-1)) / ys_len.sum()
         
-        
-        self.scaler.scale(loss).backward()
-        self.update_params()
+        if train:
+            self.scaler.scale(loss).backward()
+            self.update_params()
 
         return loss.item()
+
+    def eval_step(self, batch):
+        return self.train_step(batch, train=False)
 
     def zero_grad(self):
         """Zero out optimizer."""
@@ -609,7 +604,7 @@ class EncoderDecoder(nn.Module):
     def scheduler_step(self, val_score=None):
         self.scheduler.step(val_score)
 
-    def eval_step(self, batch):
+    def decoding_step(self, batch):
         xs, xs_len = batch['source'], batch['source_len']
         source_lang, target_lang = batch['source_lang'], batch['target_lang']
 
