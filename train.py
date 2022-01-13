@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!env/bin/python3
 
 import os
 import sys
@@ -44,7 +44,9 @@ parser.add_argument('--shared-embeddings', action='store_true',
 parser.add_argument('--model-type', choices=['bow', 'rnn', 'rnn_attn', 'transformer'], default='transformer',
                     help='which model architecture to use')
 
+
 args = parser.parse_args()
+print(args)
 
 model_dir = os.path.dirname(args.checkpoint_path)
 bpe_path = args.bpecodes or os.path.join(args.data_dir, 'bpecodes.de-en-fr')
@@ -79,14 +81,17 @@ def reset_seed(seed=1234):
     np.random.seed(seed)
     torch.manual_seed(seed)
 
+
 with open(bpe_path) as bpe_codes:
     bpe_model = BPE(bpe_codes)
+
 
 def preprocess(line, is_source=True, source_lang=None, target_lang=None):
     line = bpe_model.segment(line.lower())
     if len(target_langs) > 1 and is_source:
         line = f'<lang:{target_lang}> {line}'
     return line
+
 
 # spm = spm.SentencePieceProcessor(model_file=spm_path)
 
@@ -98,8 +103,10 @@ def preprocess(line, is_source=True, source_lang=None, target_lang=None):
 #         line = f'<lang:{target_lang}> {line}'
 #     return line
 
+
 def postprocess(line):
     return line.replace('@@ ', '')
+
 
 def load_data(source_lang, target_lang, split='train', max_size=None):
     # max_size: max number of sentence pairs in the training corpus (None = all)
@@ -122,7 +129,6 @@ for lang_pair in lang_pairs:
 
 if args.shared_embeddings:
     source_data += target_data
-
 
 source_dict = data.load_or_create_dictionary(
     source_dict_path,
@@ -150,13 +156,14 @@ for lang_pair in lang_pairs:
     data.binarize(train_data[lang_pair], source_dict, target_dict, sort=True)
     data.binarize(valid_data[lang_pair], source_dict, target_dict, sort=False)
 
-    print('{}-{}: train_size={}, valid_size={}, min_len={}, max_len={}'.format(
+    print('{}-{}: train_size={}, valid_size={}, min_len={}, max_len={}, avg_len={:.1f}'.format(
         src,
         tgt,
         len(train_data[lang_pair]),
         len(valid_data[lang_pair]),
         train_data[lang_pair]['source_len'].min(),
         train_data[lang_pair]['source_len'].max(),
+        train_data[lang_pair]['source_len'].mean(),
     ))
 
     reset_seed()
@@ -172,27 +179,59 @@ else:
     train_iterator = train_iterators[0]
 
 
-def train_model(
-        train_iterator,
-        valid_iterators,
-        model,
-        checkpoint_path,
-        epochs=10,
-        validation_frequency=1
-    ):
+def evaluate_model(test_or_valid_iterators, model, record=False):
+    """
+    valid_iterators: list of data.BatchIterator
+    model: instance of models.EncoderDecoder
+    record: save scores in the model checkpoint
+    """
+    scores = []
+    
+    # Compute chrF over all test or validation sets
+    for iterator in test_or_valid_iterators:
+        src, tgt = iterator.source_lang, iterator.target_lang
+        loss = 0
+        for batch in iterator:
+            # FIXME: this will give slightly different results with different batch sizes
+            loss += model.eval_step(batch) / len(iterator)
+        translation_output = model.translate(iterator, postprocess)
+        score = translation_output.score
+        output = translation_output.output
+        
+        print(f'{src}-{tgt}: loss={loss:.3f}, chrF={score:.2f}')
+        print(f"example translation: {output[0]}")
+        print(f"example reference:   {next(iter(iterator))['reference'][0]}")
+
+        if record:
+            model.record(f'{src}_{tgt}_loss', loss)
+            model.record(f'{src}_{tgt}_chrf', score)
+
+        scores.append(score)
+
+    # Average the validation chrF scores
+    score = sum(scores) / len(scores)
+    if len(scores) > 1:
+        print(f'chrF={score:.2f}')
+
+    return score
+
+
+def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=10):
     """
     train_iterator: instance of data.BatchIterator or data.MultiBatchIterator
     valid_iterators: list of data.BatchIterator
     model: instance of models.EncoderDecoder
     checkpoint_path: path of the model checkpoint
     epochs: iterate this many times over train_iterator
-    validation_frequency: validate the model every N epochs
     """
 
     reset_seed()
 
+    if model.epoch >= epochs:
+        evaluate_model(valid_iterators, model, record=False)
+        return
+    
     best_score = -1
-    # for epoch in range(1, epochs + 1):
     for epoch in range(model.epoch + 1, epochs + 1):
 
         start = time.time()
@@ -202,9 +241,8 @@ def train_model(
 
         # Iterate over training batches for one epoch
         for i, batch in enumerate(train_iterator, 1):
-            t = time.time()
             if args.verbose:
-                sys.stdout.write(
+                sys.stderr.write(
                     "\r{}/{}, wall={:.2f}, loss={:.3f}".format(
                         i,
                         len(train_iterator),
@@ -215,50 +253,26 @@ def train_model(
             running_loss += model.train_step(batch)
 
         if args.verbose:
-            print()
+            sys.stderr.write('\n')
 
         # Average training loss for this epoch
         epoch_loss = running_loss / len(train_iterator)
 
         print(f"loss={epoch_loss:.3f}, time={time.time() - start:.2f}")
-        sys.stdout.flush()
+        model.record('train_loss', epoch_loss)
 
-        # Evaluate and save the model
-        if epoch % validation_frequency == 0:
-            scores = []
-            
-            # Compute chrF over all validation sets
-            for valid_iterator in valid_iterators:
-                src, tgt = valid_iterator.source_lang, valid_iterator.target_lang
-                valid_loss = 0
-                for batch in valid_iterator:
-                    valid_loss += model.eval_step(batch) / len(valid_iterator)
-                translation_output = model.translate(valid_iterator, postprocess)
-                score = translation_output.score
-                output = translation_output.output
+        score = evaluate_model(valid_iterators, model, record=True)
 
-                with open(os.path.join(model_dir, f'valid.{src}-{tgt}.{epoch}.out'), 'w') as f:
-                    f.writelines(line + '\n' for line in output)
+        # Update the model's learning rate based on current performance.
+        # This scheduler divides the learning rate by 10 if chrF does not improve.
+        model.scheduler_step(score)
 
-                print(f'{src}-{tgt}: loss={valid_loss:.3f}, chrF={score:.2f}')
-                sys.stdout.flush()
-                scores.append(score)
+        # Save a model checkpoint if it has the best validation chrF so far
+        if score > best_score:
+            best_score = score
+            model.save(checkpoint_path)
 
-            # Average the validation chrF scores
-            score = round(sum(scores) / len(scores), 2)
-            if len(scores) > 1:
-                print(f'chrF={score:.2f}')
-
-            # Update the model's learning rate based on current performance.
-            # This scheduler divides the learning rate by 10 if chrF does not improve.
-            model.scheduler_step(score)
-
-            # Save a model checkpoint if it has the best validation chrF so far
-            if score > best_score:
-                best_score = score
-                model.save(checkpoint_path)
-
-        print('=' * 50)
+        print('=' * 50, flush=True)
 
     print(f'Training completed. Best chrF is {best_score:.2f}')
 
@@ -277,7 +291,7 @@ decoder_args = dict(
 )
 
 if args.model_type == 'bow':
-    encoder = models.BagOfWords(**encoder_args)
+    encoder = models.BOW_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 elif args.model_type == 'rnn':
     encoder = models.RNN_Encoder(**encoder_args)
@@ -303,7 +317,10 @@ model = models.EncoderDecoder(
 if not args.reset:
     model.load(args.checkpoint_path)
 
-print(f'checkpoint path: {args.checkpoint_path} @{model.epoch}')
+if model.epoch > 0:
+    print(f'resumed checkpoint {args.checkpoint_path} ({model.epoch} epochs)')
+else:
+    print(f'new model checkpoint: {args.checkpoint_path}')
 
 try:
     train_model(train_iterator, valid_iterators, model,

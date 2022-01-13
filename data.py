@@ -10,7 +10,7 @@ SOS_IDX, EOS_IDX, UNK_IDX, PAD_IDX = range(4)
 
 
 class Dictionary:
-    def __init__(self, minimum_count=1):
+    def __init__(self, minimum_count=10):
         self.words = []     # maps indices to words
         self.indices = {}   # maps words to indices
         self.counts = {}    # maps words to counts
@@ -56,7 +56,7 @@ class Dictionary:
             )
     
     @staticmethod
-    def load(path, minimum_count=1):
+    def load(path, minimum_count=10):
         dictionary = Dictionary(minimum_count)
 
         with open(path, 'r') as f:
@@ -91,11 +91,11 @@ def binarize(dataset, source_dict, target_dict, sort=True):
         dataset.sort_values(by=['source_len', 'target_len'], inplace=True, kind='mergesort')
 
 
-def load_or_create_dictionary(dict_path, dataset, minimum_count=10, reset=False):
+def load_or_create_dictionary(dict_path, dataset, reset=False):
     if not reset and os.path.isfile(dict_path):
-        dictionary = Dictionary.load(dict_path, minimum_count)
+        dictionary = Dictionary.load(dict_path)
     else:
-        dictionary = Dictionary(minimum_count)
+        dictionary = Dictionary()
         for tokens in dataset:
             for token in tokens:
                 dictionary.add_symbol(token)        

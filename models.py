@@ -73,7 +73,7 @@ class MultiheadAttention(nn.Module):
         return attn, torch.sum(attn_weights, dim=1) / self.num_heads, attn_weights
 
 
-class BagOfWords(nn.Module):
+class BOW_Encoder(nn.Module):
     def __init__(
         self,
         input_size,
@@ -84,7 +84,7 @@ class BagOfWords(nn.Module):
         dropout=0,
         **kwargs,
     ):
-        super(BagOfWords, self).__init__()
+        super(BOW_Encoder, self).__init__()
 
         self.emb_dim = hidden_size
 
@@ -474,14 +474,10 @@ class EncoderDecoder(nn.Module):
     ):
         super(EncoderDecoder, self).__init__()
 
-        device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
-        self.device = device
-        # self.amp = device == 'cuda'
-        self.amp = False
-        self.scaler = torch.cuda.amp.GradScaler(init_scale=2**7, growth_interval=2**14, enabled=self.amp)
+        self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
 
-        self.encoder = encoder.to(device)
-        self.decoder = decoder.to(device)
+        self.encoder = encoder.to(self.device)
+        self.decoder = decoder.to(self.device)
 
         self.target_dict = target_dict
 
@@ -495,8 +491,9 @@ class EncoderDecoder(nn.Module):
     
         self.max_len = max_len
         self.clip = clip
-        self.START = torch.LongTensor([SOS_IDX]).to(device)
-        self.END_IDX = EOS_IDX
+        self.START = torch.LongTensor([SOS_IDX]).to(self.device)
+
+        self.metrics = {}
 
     def vec2txt(self, vector):
         """Convert vector to text.
@@ -507,7 +504,7 @@ class EncoderDecoder(nn.Module):
             output_tokens = []
             # Remove the final END_TOKEN that is appended to predictions
             for token in vector:
-                if token == self.END_IDX:
+                if token == EOS_IDX:
                     break
                 else:
                     output_tokens.append(token)
@@ -557,28 +554,27 @@ class EncoderDecoder(nn.Module):
             self.encoder.eval()
             self.decoder.eval()
 
-        with torch.autocast(self.device, enabled=self.amp):
-            encoder_results = self.encoder(xs, xs_len=xs_len, lang=source_lang)
-            encoder_output = encoder_results['encoder_output']
-            encoder_hidden = encoder_results['encoder_hidden']
+        encoder_results = self.encoder(xs, xs_len=xs_len, lang=source_lang)
+        encoder_output = encoder_results['encoder_output']
+        encoder_hidden = encoder_results['encoder_hidden']
 
-            # Teacher forcing: Feed the target as the next input
-            y_in = ys.narrow(1, 0, ys.size(1) - 1)
-            decoder_input = torch.cat([starts, y_in], 1)
+        # Teacher forcing: Feed the target as the next input
+        y_in = ys.narrow(1, 0, ys.size(1) - 1)
+        decoder_input = torch.cat([starts, y_in], 1)
 
-            decoder_results = self.decoder(
-                decoder_input,
-                encoder_hidden,
-                encoder_output,
-                xs_len,
-                lang=target_lang
-            )
-            decoder_output = decoder_results['decoder_output']
-            scores = decoder_output.view(-1, decoder_output.size(-1))
-            loss = self.criterion(scores, ys.view(-1)) / ys_len.sum()
+        decoder_results = self.decoder(
+            decoder_input,
+            encoder_hidden,
+            encoder_output,
+            xs_len,
+            lang=target_lang
+        )
+        decoder_output = decoder_results['decoder_output']
+        scores = decoder_output.view(-1, decoder_output.size(-1))
+        loss = self.criterion(scores, ys.view(-1)) / ys_len.sum()
         
         if train:
-            self.scaler.scale(loss).backward()
+            loss.backward()
             self.update_params()
 
         return loss.item()
@@ -593,13 +589,11 @@ class EncoderDecoder(nn.Module):
     def update_params(self):
         """Do one optimization step."""
         if self.clip is not None:
-            self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(
                 self.encoder.parameters(), self.clip)
             torch.nn.utils.clip_grad_norm_(
                 self.decoder.parameters(), self.clip)
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        self.optimizer.step()
 
     def scheduler_step(self, val_score=None):
         self.scheduler.step(val_score)
@@ -655,7 +649,7 @@ class EncoderDecoder(nn.Module):
             for b in range(bsz):
                 if not done[b]:
                     # only add more tokens for examples that aren't done
-                    if preds[b].item() == self.END_IDX:
+                    if preds[b].item() == EOS_IDX:
                         # if we produced END, we're done
                         done[b] = True
                         total_done += 1
@@ -675,6 +669,8 @@ class EncoderDecoder(nn.Module):
                 self.scheduler.load_state_dict(ckpt['scheduler'])
             if ckpt.get('optimizer'):
                 self.optimizer.load_state_dict(ckpt['optimizer'])
+            if ckpt.get('metrics'):
+                self.metrics = ckpt['metrics']
 
     def save(self, path):
         dirname = os.path.dirname(path)
@@ -684,8 +680,12 @@ class EncoderDecoder(nn.Module):
             'model': self.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
+            'metrics': self.metrics,
         }
         torch.save(ckpt, path)
+
+    def record(self, name, value):
+        self.metrics.setdefault(self.epoch, {})[name] = value
 
     @property
     def epoch(self):
