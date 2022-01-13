@@ -15,5 +15,7 @@ pip install googletrans==3.1.0a0
 pip install pandas
 pip install sacrebleu
 pip install matplotlib
+pip install requests
+pip install bertviz
 
 bash scripts/download-data.sh
