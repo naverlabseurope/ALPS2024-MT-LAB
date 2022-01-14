@@ -33,4 +33,23 @@ scripts/run-notebook.sh     # starts a jupyter notebook where the lab will take 
 
 ### Running the notebook remotely
 
+In the following, replace `HOSTNAME` by the hostname of your server, and `USERNAME` by your username.
+
+1. SSH to the server, install the repo and start the notebook
+```
+ssh HOSTNAME
+git clone https://github.com/naverlabseurope/ALPS2022-MT-LAB.git
+cd ALPS2022-MT-LAB
+scripts/setup.sh
+scripts/run-notebook.sh  # modify this script to change the port if 8080 is already used
+```
+
+2. Create an SSH tunnel from your machine
+```
+ssh -L 8080:localhost:22 USERNAME@HOSTNAME
+```
+
+3. Open http://HOSTNAME:80880/notebooks/NMT.ipynb in your favorite browser.
+4. Enjoy!
+
 ### Command line interface for training models
