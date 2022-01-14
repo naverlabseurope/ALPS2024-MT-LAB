@@ -296,11 +296,9 @@ if args.model_type == 'bow':
     encoder = models.BOW_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 elif args.model_type == 'rnn':
-    assert args.encoder_layers == args.decoder_layers
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 elif args.model_type == 'rnn_attn':
-    assert args.decoder_layers == 1
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.AttentionDecoder(**decoder_args)
 else:
@@ -315,7 +313,7 @@ model = models.EncoderDecoder(
     decoder,
     lr=args.lr,
     use_cuda=not args.cpu,
-    target_dict=target_dict
+    target_dict=target_dict,
 )
 
 if not args.reset:

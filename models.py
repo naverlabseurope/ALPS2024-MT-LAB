@@ -82,12 +82,10 @@ class BOW_Encoder(nn.Module):
     def forward(self, input, input_len, **kwargs):   # TODO: masking
         x = self.embedding(input)
 
-        # outputs = []
         for layer in self.layers:
             x = layer(x)
             x = self.activation(x)
             x = self.dropout(x)
-            # outputs.append(x.unsqueeze(0))
         
         mask = torch.arange(input.size(1))[None, :].to(input_len.device) < input_len[:, None]
         x = x * mask.unsqueeze(-1)
@@ -99,11 +97,7 @@ class BOW_Encoder(nn.Module):
         else:
             x = x.sum(dim=1)
 
-        encoder_results = {
-            'encoder_output': x,
-            'encoder_hidden': x.unsqueeze(0),   # FIXME
-        }
-        return encoder_results
+        return x.unsqueeze(1), {}
 
 
 class RNN_Encoder(nn.Module):
@@ -122,26 +116,26 @@ class RNN_Encoder(nn.Module):
             hidden_size, hidden_size, num_layers=num_layers, batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
+        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, input, input_len, **kwargs):
         """Return encoded state.
         :param input: (batch_size x seqlen) tensor of token indices.
         """
         x = self.embedding(input)
+        x = self.dropout(x)
         x = torch.nn.utils.rnn.pack_padded_sequence(x, input_len.cpu(), batch_first=True, enforce_sorted=False)
-        x, hidden = self.gru(x)
+        x, _ = self.gru(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        encoder_results = {
-            'encoder_output': x,
-            'encoder_hidden': hidden
-        }
-        return encoder_results
+        x = self.dropout(x)
+        return x, {}
 
 
 class RNN_Decoder(nn.Module):
     """Generates a sequence of tokens in response to context."""
 
     def __init__(self, output_size, hidden_size, num_layers, dropout=0, **kwargs):
+        
         """Initialize decoder.
         :param output_size: size of embedding
         :param hidden_size: size of GRU hidden layers
@@ -152,28 +146,36 @@ class RNN_Decoder(nn.Module):
         self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
         self.dropout = nn.Dropout(p=dropout)
         self.gru = nn.GRU(
-            hidden_size, hidden_size, num_layers=num_layers, batch_first=True,
+            hidden_size * 2, hidden_size, num_layers=num_layers, batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=2)
 
-    def forward(self, input, hidden, **kwargs):
+    def forward(self, input, input_len, encoder_output, state=None, **kwargs):
         """Return encoded state.
-        :param input: batch_size x 1 tensor of token indices.
-        :param hidden: past (e.g. encoder) hidden state
+        :param input: batch_size x tgt_len tensor of token indices.
         """
+        bsz = input.size(0)
+        tgt_len = input.size(1)
+        
         x = self.embedding(input)       # BxTxH
-        hidden = self.dropout(hidden)   # 1xBxH
-        output, hidden = self.gru(x, hidden)
+        x = self.dropout(x)
+
+        if encoder_output.size(1) == 1:
+            y = encoder_output
+        else:
+            y = encoder_output[torch.arange(bsz), input_len -1].unsqueeze(1)
+        y = y.repeat(1, tgt_len, 1)
+        x = torch.cat([x, y], dim=-1)
+
+        output, hidden = self.gru(x, state)
         # output: BxTxH
         scores = self.softmax(self.out(output))
 
         decoder_results = {
             'decoder_output': scores,
-            'decoder_hidden': hidden,
-            'attention_weights': None,
-            'context_vector': None
+            'decoder_state': hidden,
         }
         return decoder_results
 
@@ -194,8 +196,7 @@ class AttentionModule(nn.Module):
         attn_score: bsz x sq_len
         """
         x = self.l1(hidden)
-        att_score = torch.bmm(encoder_outs,
-                              x.unsqueeze(-1))  # bsz x seq x 1
+        att_score = torch.bmm(encoder_outs, x.unsqueeze(-1))  # bsz x seq x 1
         att_score = att_score.squeeze(-1)       # bsz x seq
         att_score = att_score.transpose(0, 1)
 
@@ -214,61 +215,55 @@ class AttentionModule(nn.Module):
 
 
 class AttentionDecoder(nn.Module):
-    def __init__(self, output_size, hidden_size, **kwargs):
+    def __init__(self, output_size, hidden_size, num_layers, dropout=0, **kwargs):
         super(AttentionDecoder, self).__init__()
-
         self.output_size = output_size
         self.hidden_size = hidden_size
-
         self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
-        self.gru = nn.GRUCell(hidden_size*2, hidden_size, bias=True)
+        self.dropout = nn.Dropout(p=dropout)
+        self.gru = nn.GRU(
+            hidden_size * 2, hidden_size, num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0
+        )
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=1)
+        self.attention = AttentionModule(hidden_size, hidden_size)
 
-        self.attention = AttentionModule(
-            hidden_size, hidden_size)
+    def forward(self, input, input_len, encoder_output, state=None, **kwargs):
+        bsz = input.size(0)
+        tgt_len = input.size(1)
+        
+        if state:
+            hidden = state['hidden']
+            context = state['context']
+        else:
+            hidden = None
+            context = torch.zeros([bsz, self.hidden_size]).to(input.device)
+        
+        embed = self.embedding(input)
+        embed = self.dropout(embed)
+        embed = embed.transpose(0, 1)
+        decoder_output = torch.empty(tgt_len, bsz, self.output_size).to(input.device)
 
-    def forward(self, input, hidden, input_len, encoder_output=None, context_vec=None, **kwargs):
-        hidden = hidden.transpose(0, 1)
-        emb = self.embedding(input)
+        attn_weights = []
 
-        emb = emb.transpose(0, 1)
-        return_scores = torch.empty(
-            emb.size(0),
-            emb.size(1),
-            self.output_size).to(
-            input.device)
+        for t in range(tgt_len):
+            x = embed[t]
+            x = torch.cat([x, context], dim=1)
+            x, hidden = self.gru(x.unsqueeze(0), hidden)
+            x = x.squeeze(0)
+            context, attn_weights_ = self.attention(x, encoder_output, input_len)
+            out = self.out(context)
+            out = self.softmax(out)
+            decoder_output[t] = out
+            attn_weights.append(attn_weights_.transpose(0, 1))
 
-        if context_vec is None:
-            context_vec = torch.zeros(
-                [emb.size(1), self.hidden_size]).to(emb.device)
-
-        attn_wts_list = []
-
-        for t in range(emb.size(0)):
-            current_vec = emb[t]
-
-            current_vec = torch.cat([current_vec, context_vec], dim=1)
-            selected_memory = hidden[:, 0, :]
-
-            mem_out = self.gru(current_vec, selected_memory)
-
-            context_vec, weights = self.attention(
-                mem_out, encoder_output, input_len)
-
-            scores = self.out(context_vec)
-            attn_wts_list.append(weights.transpose(0, 1))
-
-            scores = self.softmax(scores)
-            return_scores[t] = scores
-
-            hidden = mem_out[:, None, :]
+        state = {'hidden': hidden, 'context': context}
 
         decoder_results = {
-            'decoder_output': return_scores.transpose(0, 1).contiguous(),
-            'decoder_hidden': hidden.transpose(0, 1),
-            'attention_weights': torch.stack(attn_wts_list, axis=1),
-            'context_vector': context_vec
+            'decoder_output': decoder_output.transpose(0, 1).contiguous(),
+            'decoder_state': state,
+            'attention_weights': torch.stack(attn_weights, axis=1),
         }
         return decoder_results
 
@@ -294,22 +289,16 @@ class TransformerEncoder(nn.Module):
         x = x.transpose(0, 1)   # src_len first
         x += self.embed_positions(x)
         
-        outputs = []
-        self_attn_weights_list = []
+        self_attn_weights = []
         for layer in self.layers:
-            x, self_attn_weights = layer(
+            x, self_attn_weights_ = layer(
                 x,
                 src_key_padding_mask=mask
             )
-            outputs.append(x.transpose(0, 1))
-            self_attn_weights_list.append(self_attn_weights)
+            self_attn_weights.append(self_attn_weights_)
 
-        encoder_results = {
-            'encoder_output': outputs[-1],
-            'encoder_hidden': torch.cat(outputs, dim=0),
-            'self_attention_weights_for_all_layers': self_attn_weights_list
-        }
-        return encoder_results
+        meta = {'self_attention_weights': self_attn_weights}
+        return x.transpose(0, 1), meta
 
 
 class TransformerDecoder(nn.Module):
@@ -327,14 +316,13 @@ class TransformerDecoder(nn.Module):
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=2)
 
-    def forward(self, input, encoder_output, input_len, context_vec=None, **kwargs):
+    def forward(self, input, input_len, encoder_output, state=None, **kwargs):
         """
-        input: Tensor of shape (batch_size, src_len)
-        encoder_output: Tensor of shape (batch_size, src_len, hidden_size)
+        input: Tensor of shape (batch_size, tgt_len)
         input_len: Tensor of shape (batch_size,)
+        encoder_output: Tensor of shape (batch_size, src_len, hidden_size)
         """
         x = self.embedding(input)
-        
         size = encoder_output.size(1)
         memory_mask = torch.arange(size)[None, :].to(input_len.device) >= input_len[:, None]
         # shape: (batch_size, src_len)
@@ -349,43 +337,42 @@ class TransformerDecoder(nn.Module):
         x = x.transpose(0, 1)   # src_len first
         encoder_output = encoder_output.transpose(0, 1)   # src_len first
         
-        if not self.training and context_vec is not None:
-            start = context_vec[0].size(0)
+        if not self.training and state is not None:
+            start = state[0].size(0)
         else:
             start = 0
         x += self.embed_positions(x, start)
         
-        if context_vec is None:
-            context_vec = [None] * len(self.layers)
+        if state is None:
+            state = [None] * len(self.layers)
 
-        self_attn_weights_list = []
+        self_attn_weights = []
 
         for i, layer in enumerate(self.layers):
-            if context_vec[i] is None:
-                context_vec[i] = x
+            if state[i] is None:
+                state[i] = x
             else:
-                context_vec[i] = torch.cat([context_vec[i], x], dim=0)
+                state[i] = torch.cat([state[i], x], dim=0)
 
-            x, self_attn_weights, attn_weights = layer(
+            x, self_attn_weights_, attn_weights = layer(
                 x,
                 encoder_output,
                 memory_key_padding_mask=memory_mask,
                 tgt_mask=tgt_mask,
-                prev_states=context_vec[i]
+                prev_states=state[i]
             )
             if self.training:
-                attn_weights = self_attn_weights = None
+                attn_weights = self_attn_weights_ = None
 
-            self_attn_weights_list.append(self_attn_weights)
+            self_attn_weights.append(self_attn_weights_)
 
         scores = self.softmax(self.out(x.transpose(0, 1)))
 
         decoder_results = {
             'decoder_output': scores,
-            'decoder_hidden': None,
+            'decoder_state': state,
             'attention_weights': attn_weights,
-            'context_vector': context_vec,
-            'self_attention_weights_for_all_layers': self_attn_weights_list
+            'self_attention_weights': self_attn_weights
         }
         return decoder_results
 
@@ -405,9 +392,11 @@ class EncoderDecoder(nn.Module):
         self.criterion = nn.NLLLoss(reduction='sum', ignore_index=PAD_IDX)
 
         self.optimizer = optim.Adam(self.parameters(), lr=lr)
+        
         self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode='max', min_lr=1e-6, patience=0, verbose=True)
-        # self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, gamma=0.5, verbose=True)
+            self.optimizer, mode='max', patience=0, factor=0.1,
+            threshold=0.5, threshold_mode='abs', verbose=True
+        )
     
         self.max_len = max_len
         self.clip = clip
@@ -474,9 +463,7 @@ class EncoderDecoder(nn.Module):
             self.encoder.eval()
             self.decoder.eval()
 
-        encoder_results = self.encoder(input, input_len=input_len)
-        encoder_output = encoder_results['encoder_output']
-        encoder_hidden = encoder_results['encoder_hidden']
+        encoder_output, _ = self.encoder(input, input_len=input_len)
 
         # Teacher forcing: Feed the target as the next input
         shifted_target = target.narrow(1, 0, target.size(1) - 1)
@@ -484,7 +471,6 @@ class EncoderDecoder(nn.Module):
 
         decoder_results = self.decoder(
             input=decoder_input,
-            hidden=encoder_hidden,
             input_len=input_len,
             encoder_output=encoder_output,
         )
@@ -515,7 +501,10 @@ class EncoderDecoder(nn.Module):
         self.optimizer.step()
 
     def scheduler_step(self, val_score=None):
-        self.scheduler.step(val_score)
+        if isinstance(self.scheduler, ReduceLROnPlateau):
+            self.scheduler.step(val_score)
+        else:
+            self.scheduler.step()
 
     def decoding_step(self, batch):
         input, input_len = batch['source'], batch['source_len']
@@ -528,43 +517,36 @@ class EncoderDecoder(nn.Module):
 
         bsz = input.size(0)
         starts = self.START.expand(bsz, 1)  # expand to batch size
-        # just predict
         self.encoder.eval()
         self.decoder.eval()
-        encoder_results = self.encoder(input, input_len=input_len)
-        encoder_output = encoder_results['encoder_output']
-        encoder_hidden = encoder_results['encoder_hidden']
-        encoder_self_attn = encoder_results.get('self_attention_weights_for_all_layers')
+        encoder_output, meta = self.encoder(input, input_len=input_len)
+        encoder_self_attn = meta.get('self_attention_weights')
 
         predictions = []
         done = [False for _ in range(bsz)]
         total_done = 0
         decoder_input = starts
-        decoder_hidden = encoder_hidden
-
+        decoder_state = None
         attn_weights = []
-        context_vec = None
 
         for _ in range(self.max_len):
             # generate at most max_len tokens
             decoder_results = self.decoder(
                 input=decoder_input,
-                hidden=decoder_hidden,
                 input_len=input_len,
                 encoder_output=encoder_output,
-                context_vec=context_vec,
+                state=decoder_state,
             )
 
             decoder_output = decoder_results['decoder_output']
-            decoder_hidden = decoder_results['decoder_hidden']
-            attn_wts = decoder_results['attention_weights']
-            context_vec = decoder_results['context_vector']
+            decoder_state = decoder_results.get('decoder_state')
+            attn_weights_ = decoder_results.get('attention_weights')
 
             _, preds = decoder_output.max(2)
             predictions.append(preds)
             decoder_input = preds  # set input to next step
 
-            attn_weights.append(attn_wts)
+            attn_weights.append(attn_weights_)
 
             # check if we've produced the end token
             for b in range(bsz):
