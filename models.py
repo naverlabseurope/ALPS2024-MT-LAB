@@ -134,7 +134,7 @@ class RNN_Encoder(nn.Module):
 class RNN_Decoder(nn.Module):
     """Generates a sequence of tokens in response to context."""
 
-    def __init__(self, output_size, hidden_size, num_layers, dropout=0, **kwargs):
+    def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, **kwargs):
         
         """Initialize decoder.
         :param output_size: size of embedding
@@ -215,7 +215,7 @@ class AttentionModule(nn.Module):
 
 
 class AttentionDecoder(nn.Module):
-    def __init__(self, output_size, hidden_size, num_layers, dropout=0, **kwargs):
+    def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, **kwargs):
         super(AttentionDecoder, self).__init__()
         self.output_size = output_size
         self.hidden_size = hidden_size
