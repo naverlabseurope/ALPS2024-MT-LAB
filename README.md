@@ -20,7 +20,7 @@ This repository is a modified version of [another tutorial on NMT](https://githu
 
 ![drive](https://user-images.githubusercontent.com/1795321/149558193-c7d008e7-09c8-418d-8fcf-2cfb517a52dc.png)
 
-6. Start playing with the notebook
+6. Start playing with the notebook. Note that the models you train in the notebook won't be saved (they will be lost when you close the notebook). However, you can manually download them to your computer or copy them to your Google Drive if you wish.
 
 ### Running the notebook on your own computer
 
@@ -30,6 +30,7 @@ cd ALPS2022-MT-LAB
 scripts/setup.sh            # creates a Python environment, installs the dependencies and downloads the data and models
 scripts/run-notebook.sh     # starts a jupyter notebook where the lab will take place
 ```
+You also need to set `colab` to False in the notebook.
 
 ### Running the notebook remotely
 
