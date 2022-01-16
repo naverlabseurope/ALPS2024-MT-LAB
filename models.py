@@ -16,7 +16,7 @@ class MultiheadAttention(nn.Module):
     """ Copied from fairseq """
 
     def __init__(self, embed_dim, num_heads, dropout=0.0):
-        super(MultiheadAttention, self).__init__()
+        super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = nn.Dropout(dropout)
@@ -67,7 +67,7 @@ class MultiheadAttention(nn.Module):
 
 class BOW_Encoder(nn.Module):
     def __init__(self, input_size, hidden_size=512, reduce="max", num_layers=1, dropout=0, **kwargs):
-        super(BOW_Encoder, self).__init__()
+        super().__init__()
         self.emb_dim = hidden_size
         self.reduce = reduce
         assert(self.reduce in ["sum", "mean", "max"])
@@ -182,7 +182,7 @@ class RNN_Decoder(nn.Module):
 
 class AttentionModule(nn.Module):
     def __init__(self, hidden_size, output_size):
-        super(AttentionModule, self).__init__()
+        super().__init__()
         self.l1 = nn.Linear(hidden_size, output_size, bias=False)
         self.l2 = nn.Linear(hidden_size + output_size, output_size, bias=False)
 
@@ -216,7 +216,7 @@ class AttentionModule(nn.Module):
 
 class AttentionDecoder(nn.Module):
     def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, **kwargs):
-        super(AttentionDecoder, self).__init__()
+        super().__init__()
         self.output_size = output_size
         self.hidden_size = hidden_size
         self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
@@ -270,17 +270,18 @@ class AttentionDecoder(nn.Module):
 
 class TransformerEncoder(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=1, dropout=0, heads=4, **kwargs):
-        super(TransformerEncoder, self).__init__()
-
+        super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.heads = heads
+        self.dropout = dropout
         self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=PAD_IDX)
         self.embed_positions = PositionalEncoding(hidden_size)
-        self.layers = nn.ModuleList([
-            TransformerEncoderLayer(hidden_size, heads, hidden_size, dropout)
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList([self.build_layer(i) for i in range(num_layers)])
     
+    def build_layer(self, layer_id):
+        return TransformerEncoderLayer(self.hidden_size, self.heads, self.dropout)
+
     def forward(self, input, input_len, **kwargs):
         x = self.embedding(input)
         mask = torch.arange(input.size(1))[None, :].to(input_len.device) >= input_len[:, None]
@@ -303,18 +304,19 @@ class TransformerEncoder(nn.Module):
 
 class TransformerDecoder(nn.Module):
     def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, heads=4, **kwargs):
-        super(TransformerDecoder, self).__init__()
-
+        super().__init__()
         self.output_size = output_size
         self.hidden_size = hidden_size
+        self.heads = heads
+        self.dropout = dropout
         self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
         self.embed_positions = PositionalEncoding(hidden_size)
-        self.layers = nn.ModuleList([
-            TransformerDecoderLayer(hidden_size, heads, hidden_size, dropout)
-            for _ in range(num_layers)
-        ])
+        self.layers = nn.ModuleList([self.build_layer(i) for i in range(num_layers)])
         self.out = nn.Linear(hidden_size, output_size)
         self.softmax = nn.LogSoftmax(dim=2)
+
+    def build_layer(self, layer_id):
+        return TransformerDecoderLayer(self.hidden_size, self.heads, self.dropout)
 
     def forward(self, input, input_len, encoder_output, state=None, **kwargs):
         """
@@ -379,30 +381,25 @@ class TransformerDecoder(nn.Module):
 
 class EncoderDecoder(nn.Module):
     def __init__(self, encoder, decoder, target_dict, lr=1e-3, use_cuda=True, max_len=50, clip=0.3):
-        super(EncoderDecoder, self).__init__()
-
+        super().__init__()
         self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
-
         self.encoder = encoder.to(self.device)
         self.decoder = decoder.to(self.device)
-
         self.target_dict = target_dict
-
-        # set up the criterion
+        self.lr = lr
+        self.max_len = max_len
+        self.clip = clip
         self.criterion = nn.NLLLoss(reduction='sum', ignore_index=PAD_IDX)
+        self.reset_optimizer()
+        self.START = torch.LongTensor([SOS_IDX]).to(self.device)
+        self.metrics = {}
 
-        self.optimizer = optim.Adam(self.parameters(), lr=lr)
-        
+    def reset_optimizer(self):
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         self.scheduler = ReduceLROnPlateau(
             self.optimizer, mode='max', patience=0, factor=0.1,
             threshold=0.5, threshold_mode='abs', verbose=True
         )
-    
-        self.max_len = max_len
-        self.clip = clip
-        self.START = torch.LongTensor([SOS_IDX]).to(self.device)
-
-        self.metrics = {}
 
     def vec2txt(self, vector):
         """
@@ -564,16 +561,19 @@ class EncoderDecoder(nn.Module):
         attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1)
         return self.vec2txt(predictions), attn, encoder_self_attn
 
-    def load(self, path):
+    def load(self, path, strict=True, reset_optimizer=False):
         if os.path.isfile(path):
             ckpt = torch.load(path)
-            self.load_state_dict(ckpt['model'])
-            if ckpt.get('scheduler'):
-                self.scheduler.load_state_dict(ckpt['scheduler'])
-            if ckpt.get('optimizer'):
-                self.optimizer.load_state_dict(ckpt['optimizer'])
-            if ckpt.get('metrics'):
-                self.metrics = ckpt['metrics']
+            self.load_state_dict(ckpt['model'], strict=strict)
+            if not reset_optimizer:
+                if ckpt.get('scheduler'):
+                    state_dict = ckpt['scheduler']
+                    state_dict.pop('best', None)  # scores won't be comparable if we change valid set
+                    self.scheduler.load_state_dict(state_dict)
+                if ckpt.get('optimizer'):
+                    self.optimizer.load_state_dict(ckpt['optimizer'])
+                if ckpt.get('metrics'):
+                    self.metrics = ckpt['metrics']
 
     def save(self, path):
         dirname = os.path.dirname(path)
@@ -596,12 +596,13 @@ class EncoderDecoder(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, ffn_dim, dropout=0, activation=F.relu):
-        super(TransformerEncoderLayer, self).__init__()
+    def __init__(self, hidden_size, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
+        super().__init__()
+        self.hidden_size = hidden_size
         self.self_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
-        self.linear1 = nn.Linear(hidden_size, ffn_dim)
+        self.linear1 = nn.Linear(hidden_size, ffn_dim or hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(ffn_dim, hidden_size)
+        self.linear2 = nn.Linear(ffn_dim or hidden_size, hidden_size)
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
         self.dropout1 = nn.Dropout(dropout)
@@ -624,13 +625,14 @@ class TransformerEncoderLayer(nn.Module):
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, ffn_dim, dropout=0, activation=F.relu):
-        super(TransformerDecoderLayer, self).__init__()
+    def __init__(self, hidden_size, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
+        super().__init__()
+        self.hidden_size = hidden_size
         self.self_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
         self.multihead_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
-        self.linear1 = nn.Linear(hidden_size, ffn_dim)
+        self.linear1 = nn.Linear(hidden_size, ffn_dim or hidden_size)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(ffn_dim, hidden_size)
+        self.linear2 = nn.Linear(ffn_dim or hidden_size, hidden_size)
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
         self.norm3 = nn.LayerNorm(hidden_size)
@@ -678,3 +680,100 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x, start=0):
         return x + self.pe[start:start + x.size(0), :].to(x.device)
+
+
+class AdapterLayer(nn.Module):
+    def __init__(self, input_dim, projection_dim):
+        super().__init__()
+        self.down = nn.Linear(input_dim, projection_dim)
+        self.up = nn.Linear(projection_dim, input_dim)
+        self.layer_norm = nn.LayerNorm(input_dim)
+        nn.init.uniform_(self.down.weight, -1e-6, 1e-6)
+        nn.init.uniform_(self.up.weight, -1e-6, 1e-6)
+        nn.init.zeros_(self.down.bias)
+        nn.init.zeros_(self.up.bias)
+
+    def forward(self, x):
+        y = self.layer_norm(x)
+        y = self.down(y)
+        y = F.relu(y)
+        y = self.up(y)
+        return x + y
+
+
+class AdapterTransformerEncoderLayer(TransformerEncoderLayer):
+    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.adapters = nn.ModuleDict({
+            id: AdapterLayer(self.hidden_size, projection_dim)
+            for id in adapter_ids
+        })
+        self.adapter_id = None
+    
+    def forward(self, *args, **kwargs):
+        x, *out = super().forward(*args, **kwargs)
+        if self.adapter_id is not None:
+            x = self.adapters[self.adapter_id](x)
+        return x, *out
+
+
+class AdapterTransformerEncoder(TransformerEncoder):
+    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
+        self.adapter_ids = adapter_ids
+        self.projection_dim = projection_dim
+        super().__init__(*args, **kwargs)
+        for name, param in self.named_parameters():
+            if '.adapters.' not in name:
+                param.requires_grad = False
+
+    def select_adapter(self, id):
+        for layer in self.layers:
+            layer.adapter_id = id
+
+    def build_layer(self, layer_id):
+        return AdapterTransformerEncoderLayer(
+            self.adapter_ids,
+            self.projection_dim,
+            self.hidden_size,
+            self.heads,
+            self.dropout
+        )
+
+
+class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
+    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.adapters = nn.ModuleDict({
+            id: AdapterLayer(self.hidden_size, projection_dim)
+            for id in adapter_ids
+        })
+        self.adapter_id = None
+    
+    def forward(self, *args, **kwargs):
+        x, *out = super().forward(*args, **kwargs)
+        if self.adapter_id is not None:
+            x = self.adapters[self.adapter_id](x)
+        return x, *out
+
+
+class AdapterTransformerDecoder(TransformerDecoder):
+    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
+        self.adapter_ids = adapter_ids
+        self.projection_dim = projection_dim
+        super().__init__(*args, **kwargs)
+        for name, param in self.named_parameters():
+            if '.adapters.' not in name:
+                param.requires_grad = False
+
+    def select_adapter(self, id):
+        for layer in self.layers:
+            layer.adapter_id = id
+
+    def build_layer(self, layer_id):
+        return AdapterTransformerDecoderLayer(
+            self.adapter_ids,
+            self.projection_dim,
+            self.hidden_size,
+            self.heads,
+            self.dropout
+        )

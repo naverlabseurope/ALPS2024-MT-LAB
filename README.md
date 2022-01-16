@@ -33,6 +33,7 @@ scripts/setup.sh            # creates a Python environment, installs the depende
 scripts/run-notebook.sh     # starts a jupyter notebook where the lab will take place
 ```
 You also need to set `colab = False` in the notebook.
+If you don't have a GPU, you need to set `cpu = True`. Models will be very slow to train, but you can still do inference in a reasonable time.
 
 ### Running the notebook remotely
 
