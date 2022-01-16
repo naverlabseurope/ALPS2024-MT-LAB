@@ -17,9 +17,11 @@ class Dictionary:
         self.minimum_count = minimum_count
 
         for token in SPECIAL_SYMBOLS:
-            self.add_symbol(token, minimum_count)
+            self.add_symbol(token)
 
-    def add_symbol(self, word, count=1):
+    def add_symbol(self, word, count=None):
+        count = count or self.minimum_count
+
         self.counts[word] = self.counts.get(word, 0) + count
 
         if word not in self.indices and self.counts[word] >= self.minimum_count:
@@ -33,6 +35,15 @@ class Dictionary:
     def index(self, word):
         return self.indices.get(word, UNK_IDX)
     
+    def __getitem__(self, index):
+        return self.words[index]
+
+    def __setitem__(self, index, word):
+        old_word = self.words[index]
+        self.words[index] = word
+        self.indices.pop(old_word)
+        self.indices[word] = index
+
     def vec2txt(self, indices):
         tokens = []
         for index in indices:
@@ -98,23 +109,28 @@ def load_or_create_dictionary(dict_path, dataset, reset=False):
         dictionary = Dictionary()
         for tokens in dataset:
             for token in tokens:
-                dictionary.add_symbol(token)        
+                dictionary.add_symbol(token, count=1)
         dictionary.save(dict_path)
 
     return dictionary
 
 
-def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None):
+def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None, filter_fn=None):
     dataset = pd.DataFrame()
 
-    with open("{}.{}".format(path, source_lang)) as source_file:
-        lines = [line.strip() for line in source_file]
-        dataset['source_data'] = lines if max_size is None else lines[:max_size]
-    
-    with open("{}.{}".format(path, target_lang)) as target_file:
-        lines = [line.strip() for line in target_file]
-        dataset['target_data'] = lines if max_size is None else lines[:max_size]
+    with open(f'{path}.{source_lang}') as source_file, open(f'{path}.{target_lang}') as target_file:
+        source_data = []
+        target_data = []
+        for source_line, target_line in zip(source_file, target_file):
+            if filter_fn is None or filter_fn(source_line, target_line):
+                source_line = source_data.append(source_line.strip())
+                target_line = target_data.append(target_line.strip())
 
+            if max_size and len(source_data) == max_size:
+                break
+        dataset['source_data'] = source_data
+        dataset['target_data'] = target_data
+        
     def preprocess_and_split(x, is_source):
         if preprocess is not None:
             x = preprocess(
