@@ -1,5 +1,4 @@
 import os
-from sched import scheduler
 import torch
 from torch import optim
 import torch.nn as nn
