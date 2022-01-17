@@ -1,4 +1,5 @@
 import os
+from sched import scheduler
 import torch
 from torch import optim
 import torch.nn as nn
@@ -10,6 +11,33 @@ from collections import namedtuple
 import sacrebleu
 
 from data import PAD_IDX, SOS_IDX, EOS_IDX
+
+
+class Encoder(nn.Module):
+    def __init__(self, source_dict, hidden_size=512, num_layers=1, dropout=0, **kwargs):
+        super().__init__()
+        self.source_dict = source_dict
+        self.input_size = len(source_dict)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.embedding = nn.Embedding(self.input_size, self.hidden_size, padding_idx=PAD_IDX)
+        self.dropout_layer = nn.Dropout(p=self.dropout)
+
+
+class Decoder(nn.Module):
+    def __init__(self, target_dict, hidden_size=512, num_layers=1, dropout=0, embedding=None, **kwargs):
+        super().__init__()
+        self.target_dict = target_dict
+        self.output_size = len(target_dict)
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        if embedding is None:
+            self.embedding = nn.Embedding(self.output_size, self.hidden_size, padding_idx=PAD_IDX)
+        else:
+            self.embedding = embedding
+        self.dropout_layer = nn.Dropout(p=self.dropout)
 
 
 class MultiheadAttention(nn.Module):
@@ -65,27 +93,23 @@ class MultiheadAttention(nn.Module):
         return attn, torch.sum(attn_weights, dim=1) / self.num_heads, attn_weights
 
 
-class BOW_Encoder(nn.Module):
-    def __init__(self, input_size, hidden_size=512, reduce="max", num_layers=1, dropout=0, **kwargs):
-        super().__init__()
-        self.emb_dim = hidden_size
+class BOW_Encoder(Encoder):
+    def __init__(self, *args, reduce="max", **kwargs):
+        super().__init__(*args, **kwargs)
         self.reduce = reduce
         assert(self.reduce in ["sum", "mean", "max"])
-        self.hidden_size = hidden_size
         self.activation = nn.ReLU()
-        self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=PAD_IDX)
-        self.dropout = nn.Dropout(p=dropout)
-        self.layers = nn.ModuleList([nn.Linear(self.emb_dim, self.hidden_size)])
-        for _ in range(num_layers - 1):
+        self.layers = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size)])
+        for _ in range(self.num_layers - 1):
             self.layers.append(nn.Linear(self.hidden_size, self.hidden_size))
 
-    def forward(self, input, input_len, **kwargs):   # TODO: masking
+    def forward(self, input, input_len, **kwargs):
         x = self.embedding(input)
 
         for layer in self.layers:
             x = layer(x)
             x = self.activation(x)
-            x = self.dropout(x)
+            x = self.dropout_layer(x)
         
         mask = torch.arange(input.size(1))[None, :].to(input_len.device) < input_len[:, None]
         x = x * mask.unsqueeze(-1)
@@ -100,56 +124,35 @@ class BOW_Encoder(nn.Module):
         return x.unsqueeze(1), {}
 
 
-class RNN_Encoder(nn.Module):
-    """Encodes the input context."""
-
-    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0, **kwargs):
-        """Initialize encoder.
-        :param input_size: size of embedding
-        :param hidden_size: size of GRU hidden layers
-        :param num_layers: number of GRU layers
-        """
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=PAD_IDX)
+class RNN_Encoder(Encoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.gru = nn.GRU(
-            hidden_size, hidden_size, num_layers=num_layers, batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            self.hidden_size, self.hidden_size, num_layers=self.num_layers, batch_first=True,
+            dropout=self.dropout if self.num_layers > 1 else 0
         )
-        self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, input, input_len, **kwargs):
         """Return encoded state.
         :param input: (batch_size x seqlen) tensor of token indices.
         """
         x = self.embedding(input)
-        x = self.dropout(x)
+        x = self.dropout_layer(x)
         x = torch.nn.utils.rnn.pack_padded_sequence(x, input_len.cpu(), batch_first=True, enforce_sorted=False)
         x, _ = self.gru(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x = self.dropout(x)
+        x = self.dropout_layer(x)
         return x, {}
 
 
-class RNN_Decoder(nn.Module):
-    """Generates a sequence of tokens in response to context."""
-
-    def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, **kwargs):
-        
-        """Initialize decoder.
-        :param output_size: size of embedding
-        :param hidden_size: size of GRU hidden layers
-        :param num_layers: number of GRU layers
-        """
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
-        self.dropout = nn.Dropout(p=dropout)
+class RNN_Decoder(Decoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.gru = nn.GRU(
-            hidden_size * 2, hidden_size, num_layers=num_layers, batch_first=True,
-            dropout=dropout if num_layers > 1 else 0
+            self.hidden_size * 2, self.hidden_size, num_layers=self.num_layers, batch_first=True,
+            dropout=self.dropout if self.num_layers > 1 else 0
         )
-        self.out = nn.Linear(hidden_size, output_size)
+        self.out = nn.Linear(self.hidden_size, self.output_size)
         self.softmax = nn.LogSoftmax(dim=2)
 
     def forward(self, input, input_len, encoder_output, state=None, **kwargs):
@@ -160,7 +163,7 @@ class RNN_Decoder(nn.Module):
         tgt_len = input.size(1)
         
         x = self.embedding(input)       # BxTxH
-        x = self.dropout(x)
+        x = self.dropout_layer(x)
 
         if encoder_output.size(1) == 1:
             y = encoder_output
@@ -214,20 +217,16 @@ class AttentionModule(nn.Module):
         return x, attn_scores
 
 
-class AttentionDecoder(nn.Module):
-    def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, **kwargs):
-        super().__init__()
-        self.output_size = output_size
-        self.hidden_size = hidden_size
-        self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
-        self.dropout = nn.Dropout(p=dropout)
+class AttentionDecoder(Decoder):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         self.gru = nn.GRU(
-            hidden_size * 2, hidden_size, num_layers=num_layers,
-            dropout=dropout if num_layers > 1 else 0
+            self.hidden_size * 2, self.hidden_size, num_layers=self.num_layers,
+            dropout=self.dropout if self.num_layers > 1 else 0
         )
-        self.out = nn.Linear(hidden_size, output_size)
+        self.out = nn.Linear(self.hidden_size, self.output_size)
+        self.attention = AttentionModule(self.hidden_size, self.hidden_size)
         self.softmax = nn.LogSoftmax(dim=1)
-        self.attention = AttentionModule(hidden_size, hidden_size)
 
     def forward(self, input, input_len, encoder_output, state=None, **kwargs):
         bsz = input.size(0)
@@ -241,7 +240,7 @@ class AttentionDecoder(nn.Module):
             context = torch.zeros([bsz, self.hidden_size]).to(input.device)
         
         embed = self.embedding(input)
-        embed = self.dropout(embed)
+        embed = self.dropout_layer(embed)
         embed = embed.transpose(0, 1)
         decoder_output = torch.empty(tgt_len, bsz, self.output_size).to(input.device)
 
@@ -268,16 +267,12 @@ class AttentionDecoder(nn.Module):
         return decoder_results
 
 
-class TransformerEncoder(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0, heads=4, **kwargs):
-        super().__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
+class TransformerEncoder(Encoder):
+    def __init__(self, *args, heads=4, **kwargs):
+        super().__init__(*args, **kwargs)
         self.heads = heads
-        self.dropout = dropout
-        self.embedding = nn.Embedding(input_size, hidden_size, padding_idx=PAD_IDX)
-        self.embed_positions = PositionalEncoding(hidden_size)
-        self.layers = nn.ModuleList([self.build_layer(i) for i in range(num_layers)])
+        self.embed_positions = PositionalEncoding(self.hidden_size)
+        self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
     
     def build_layer(self, layer_id):
         return TransformerEncoderLayer(self.hidden_size, self.heads, self.dropout)
@@ -302,17 +297,13 @@ class TransformerEncoder(nn.Module):
         return x.transpose(0, 1), meta
 
 
-class TransformerDecoder(nn.Module):
-    def __init__(self, output_size, hidden_size, num_layers=1, dropout=0, heads=4, **kwargs):
-        super().__init__()
-        self.output_size = output_size
-        self.hidden_size = hidden_size
+class TransformerDecoder(Decoder):
+    def __init__(self, *args, heads=4, **kwargs):
+        super().__init__(*args, **kwargs)
         self.heads = heads
-        self.dropout = dropout
-        self.embedding = nn.Embedding(output_size, hidden_size, padding_idx=PAD_IDX)
-        self.embed_positions = PositionalEncoding(hidden_size)
-        self.layers = nn.ModuleList([self.build_layer(i) for i in range(num_layers)])
-        self.out = nn.Linear(hidden_size, output_size)
+        self.embed_positions = PositionalEncoding(self.hidden_size)
+        self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
+        self.out = nn.Linear(self.hidden_size, self.output_size)
         self.softmax = nn.LogSoftmax(dim=2)
 
     def build_layer(self, layer_id):
@@ -380,26 +371,46 @@ class TransformerDecoder(nn.Module):
 
 
 class EncoderDecoder(nn.Module):
-    def __init__(self, encoder, decoder, target_dict, lr=1e-3, use_cuda=True, max_len=50, clip=0.3):
+    def __init__(self, encoder, decoder, lr=1e-3, use_cuda=True, max_len=50, clip=0.3, scheduler=None, scheduler_args=None):
         super().__init__()
         self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
         self.encoder = encoder.to(self.device)
         self.decoder = decoder.to(self.device)
-        self.target_dict = target_dict
         self.lr = lr
         self.max_len = max_len
         self.clip = clip
         self.criterion = nn.NLLLoss(reduction='sum', ignore_index=PAD_IDX)
+        scheduler_args = scheduler_args or {}
+        if scheduler is None:
+            self.scheduler_fn = ReduceLROnPlateau
+            self.scheduler_args = dict(
+                mode='max',
+                patience=0,
+                factor=0.1,      # when chrF plateaus, divide learning rate by 10
+                threshold=0.5,   # reduce LR if chrF is lower than best chrF + 0.5 (i.e., if does not improve enough)
+                threshold_mode='abs',
+                verbose=True)
+            dict.update(scheduler_args)   # can partially change the default values
+        else:
+            # can specify a different scheduler (e.g., ExponentialLR)
+            # the scheduler's arguments need to be specified in full (as a dict)
+            self.scheduler_fn = scheduler
+            self.scheduler_args = scheduler_args
         self.reset_optimizer()
         self.START = torch.LongTensor([SOS_IDX]).to(self.device)
         self.metrics = {}
 
+    @property
+    def source_dict(self):
+        return self.encoder.source_dict
+
+    @property
+    def target_dict(self):
+        return self.decoder.target_dict
+
     def reset_optimizer(self):
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
-        self.scheduler = ReduceLROnPlateau(
-            self.optimizer, mode='max', patience=0, factor=0.1,
-            threshold=0.5, threshold_mode='abs', verbose=True
-        )
+        self.scheduler = self.scheduler_fn(self.optimizer, **self.scheduler_args)
 
     def vec2txt(self, vector):
         """
@@ -565,6 +576,7 @@ class EncoderDecoder(nn.Module):
         if os.path.isfile(path):
             ckpt = torch.load(path)
             self.load_state_dict(ckpt['model'], strict=strict)
+            self.reset_optimizer()
             if not reset_optimizer:
                 if ckpt.get('scheduler'):
                     state_dict = ckpt['scheduler']

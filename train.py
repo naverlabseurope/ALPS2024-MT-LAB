@@ -24,7 +24,6 @@ parser.add_argument('--lang-pairs', nargs='+',
 parser.add_argument('--source-dict', help='Path to the source dictionary. Default: dict.SRC.txt in the same directory as the checkpoint')
 parser.add_argument('--target-dict', help='Path to the target dictionary. Default: dict.TGT.txt in the same directory as the checkpoint')
 parser.add_argument('--bpecodes', help='Path to the BPE model. Default: DATA_DIR/bpecodes.de-en-fr')
-# parser.add_argument('--spm-path', help='Path to the SentencePiece model. Default: DATA_DIR/spm.de-en-fr.model')
 parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs. Default: 10')
 parser.add_argument('--encoder-layers', type=int, default=1, help='Number of encoder layers. Default: 1')
 parser.add_argument('--decoder-layers', type=int, default=1, help='Number of decoder layers. Default: 1')
@@ -50,7 +49,6 @@ print(args)
 
 model_dir = os.path.dirname(args.checkpoint_path)
 bpe_path = args.bpecodes or os.path.join(args.data_dir, 'bpecodes.de-en-fr')
-# spm_path = args.spm_path or os.path.join(args.data_dir, 'spm.de-en-fr.model')
 
 if args.lang_pairs:
     lang_pairs = [tuple(lang_pair.split('-')) for lang_pair in args.lang_pairs]
@@ -91,17 +89,6 @@ def preprocess(line, is_source=True, source_lang=None, target_lang=None):
     if len(target_langs) > 1 and is_source:
         line = f'<lang:{target_lang}> {line}'
     return line
-
-
-# spm = spm.SentencePieceProcessor(model_file=spm_path)
-
-# def preprocess(line, is_source=True, source_lang=None, target_lang=None):
-#     line = line.strip()
-#     if line:
-#         line = ' '.join(spm.encode_as_pieces(line.lower()))
-#     if len(target_langs) > 1 and is_source:
-#         line = f'<lang:{target_lang}> {line}'
-#     return line
 
 
 def postprocess(line):
@@ -192,7 +179,6 @@ def evaluate_model(test_or_valid_iterators, model, record=False):
         src, tgt = iterator.source_lang, iterator.target_lang
         loss = 0
         for batch in iterator:
-            # FIXME: this will give slightly different results with different batch sizes
             loss += model.eval_step(batch) / len(iterator)
         translation_output = model.translate(iterator, postprocess)
         score = translation_output.score
@@ -216,11 +202,11 @@ def evaluate_model(test_or_valid_iterators, model, record=False):
     return score
 
 
-def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=10):
+def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=10):
     """
+    model: instance of models.EncoderDecoder
     train_iterator: instance of data.BatchIterator or data.MultiBatchIterator
     valid_iterators: list of data.BatchIterator
-    model: instance of models.EncoderDecoder
     checkpoint_path: path of the model checkpoint
     epochs: iterate this many times over train_iterator
     """
@@ -280,13 +266,13 @@ def train_model(train_iterator, valid_iterators, model, checkpoint_path, epochs=
 
 
 encoder_args = dict(
-    input_size=len(source_dict),
+    source_dict=source_dict,
     hidden_size=args.hidden_size,
     num_layers=args.encoder_layers,
     dropout=args.dropout,
 )
 decoder_args = dict(
-    output_size=len(target_dict),
+    target_dict=target_dict,
     hidden_size=args.hidden_size,
     num_layers=args.decoder_layers,
     dropout=args.dropout,
@@ -313,7 +299,6 @@ model = models.EncoderDecoder(
     decoder,
     lr=args.lr,
     use_cuda=not args.cpu,
-    target_dict=target_dict,
 )
 
 if not args.reset:
@@ -325,7 +310,7 @@ else:
     print(f'new model checkpoint: {args.checkpoint_path}')
 
 try:
-    train_model(train_iterator, valid_iterators, model,
+    train_model(model, train_iterator, valid_iterators,
                 epochs=args.epochs,
                 checkpoint_path=args.checkpoint_path)
 except KeyboardInterrupt:
