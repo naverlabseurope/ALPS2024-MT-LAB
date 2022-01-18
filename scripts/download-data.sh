@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 
-source env/bin/activate
+if [ -d env ]; then
+    source env/bin/activate
+fi
 
 # Download and pre-process multi-parallel (de, fr, en) data from OPUS
 if [ ! -f data/train.en-fr.fr ]; then
