@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
-from functools import partial
+
 
 import torch
 
@@ -158,6 +158,10 @@ def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None)
         dataset['target_tokenized'] = target_tokenized
 
     return dataset
+
+
+def concatenate_datasets(datasets):
+    return pd.concat(datasets, ignore_index=True)
 
 
 class BatchIterator:

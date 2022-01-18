@@ -788,3 +788,27 @@ class AdapterTransformerDecoder(TransformerDecoder):
             self.heads,
             self.dropout
         )
+
+
+class WarmupLR(torch.optim.lr_scheduler._LRScheduler):
+    @staticmethod
+    def add_args(parser):
+        parser.add_argument('--warmup', type=int, default=1000)
+        parser.add_argument('--init-lr', type=float, default=0.0)
+
+    def __init__(self, args, optimizer, last_epoch=-1, verbose=False):
+        self.warmup = args.warmup
+        self.init_lr = args.init_lr
+        if self.init_lr < 0:
+            self.init_lr = 0 if self.warmup > 0 else args.lr
+
+        self.lr_step = (args.lr - self.init_lr) / self.warmup
+        self.decay_factor = args.lr * self.warmup ** 0.5
+        super(WarmupLR, self).__init__(optimizer, last_epoch, verbose)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup:
+            lr = self.init_lr + self.last_epoch * self.lr_step
+        else:
+            lr = self.decay_factor * self.last_epoch ** -0.5
+        return [lr] * len(self.optimizer.param_groups)
