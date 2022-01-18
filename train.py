@@ -84,11 +84,13 @@ with open(bpe_path) as bpe_codes:
     bpe_model = BPE(bpe_codes)
 
 
-def preprocess(line, is_source=True, source_lang=None, target_lang=None):
-    line = bpe_model.segment(line.lower())
-    if len(target_langs) > 1 and is_source:
-        line = f'<lang:{target_lang}> {line}'
-    return line
+def preprocess(source_line, target_line, source_lang=None, target_lang=None):
+    source_line = bpe_model.segment(source_line.lower())
+    target_line = bpe_model.segment(target_line.lower())
+
+    if len(target_langs) > 1:
+        source_line = f'<lang:{target_lang}> {source_line}'
+    return source_line, target_line
 
 
 def postprocess(line):

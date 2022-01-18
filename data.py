@@ -115,34 +115,48 @@ def load_or_create_dictionary(dict_path, dataset, reset=False):
     return dictionary
 
 
-def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None, filter_fn=None):
+def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None):
     dataset = pd.DataFrame()
+
+    def preprocess_and_split(source_line, target_line):
+        if preprocess is not None:
+            tok_pair = preprocess(
+                source_line, target_line,
+                source_lang=source_lang,
+                target_lang=target_lang
+            )
+            if not tok_pair:
+                return None
+            source_line, target_line = tok_pair
+        return source_line.split(), target_line.split()
 
     with open(f'{path}.{source_lang}') as source_file, open(f'{path}.{target_lang}') as target_file:
         source_data = []
         target_data = []
+
+        source_tokenized = []
+        target_tokenized = []
+        
         for source_line, target_line in zip(source_file, target_file):
-            if filter_fn is None or filter_fn(source_line, target_line):
-                source_line = source_data.append(source_line.strip())
-                target_line = target_data.append(target_line.strip())
+            # if filter_fn is None or filter_fn(source_line, target_line):
+            source_line, target_line = source_line.strip(), target_line.strip()
+            tok_pair = preprocess_and_split(source_line, target_line)
+            if not tok_pair:   # if 'preprocess' returns None, this means that we filter out this example
+                continue
+            src_tok, tgt_tok = tok_pair
+            source_data.append(source_line)
+            target_data.append(target_line)
+            source_tokenized.append(src_tok)
+            target_tokenized.append(tgt_tok)
 
             if max_size and len(source_data) == max_size:
                 break
+        
         dataset['source_data'] = source_data
         dataset['target_data'] = target_data
-        
-    def preprocess_and_split(x, is_source):
-        if preprocess is not None:
-            x = preprocess(
-                x,
-                is_source=is_source,
-                source_lang=source_lang,
-                target_lang=target_lang
-            )
-        return x.split()
+        dataset['source_tokenized'] = source_tokenized
+        dataset['target_tokenized'] = target_tokenized
 
-    dataset['source_tokenized'] = dataset['source_data'].apply(partial(preprocess_and_split, is_source=True))
-    dataset['target_tokenized'] = dataset['target_data'].apply(partial(preprocess_and_split, is_source=False))
     return dataset
 
 
