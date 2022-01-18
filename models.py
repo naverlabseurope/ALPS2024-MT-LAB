@@ -725,7 +725,7 @@ class AdapterTransformerEncoderLayer(TransformerEncoderLayer):
         x, *out = super().forward(*args, **kwargs)
         if self.adapter_id is not None:
             x = self.adapters[self.adapter_id](x)
-        return x, *out
+        return (x, *out)
 
 
 class AdapterTransformerEncoder(TransformerEncoder):
@@ -764,7 +764,7 @@ class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
         x, *out = super().forward(*args, **kwargs)
         if self.adapter_id is not None:
             x = self.adapters[self.adapter_id](x)
-        return x, *out
+        return (x, *out)
 
 
 class AdapterTransformerDecoder(TransformerDecoder):
