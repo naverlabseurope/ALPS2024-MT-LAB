@@ -13,30 +13,34 @@ from data import PAD_IDX, SOS_IDX, EOS_IDX
 
 
 class Encoder(nn.Module):
-    def __init__(self, source_dict, hidden_size=512, num_layers=1, dropout=0, **kwargs):
+    def __init__(self, source_dict, embed_dim=512, num_layers=1, dropout=0, **kwargs):
         super().__init__()
         self.source_dict = source_dict
         self.input_size = len(source_dict)
-        self.hidden_size = hidden_size
+        self.embed_dim = embed_dim
         self.num_layers = num_layers
-        self.dropout = dropout
-        self.embedding = nn.Embedding(self.input_size, self.hidden_size, padding_idx=PAD_IDX)
-        self.dropout_layer = nn.Dropout(p=self.dropout)
+        self.dropout_rate = dropout
+        self.embed_tokens = nn.Embedding(self.input_size, self.embed_dim, padding_idx=PAD_IDX)
+        nn.init.normal_(self.embed_tokens.weight, mean=0, std=self.embed_tokens.weight.size(-1) ** -0.5)
+        nn.init.constant_(self.embed_tokens.weight[PAD_IDX], 0)
+        self.dropout = nn.Dropout(p=self.dropout_rate)
 
 
 class Decoder(nn.Module):
-    def __init__(self, target_dict, hidden_size=512, num_layers=1, dropout=0, embedding=None, **kwargs):
+    def __init__(self, target_dict, embed_dim=512, num_layers=1, dropout=0, embed_tokens=None, **kwargs):
         super().__init__()
         self.target_dict = target_dict
         self.output_size = len(target_dict)
-        self.hidden_size = hidden_size
+        self.embed_dim = embed_dim
         self.num_layers = num_layers
-        self.dropout = dropout
-        if embedding is None:
-            self.embedding = nn.Embedding(self.output_size, self.hidden_size, padding_idx=PAD_IDX)
+        self.dropout_rate = dropout
+        if embed_tokens is None:
+            self.embed_tokens = nn.Embedding(self.output_size, self.embed_dim, padding_idx=PAD_IDX)
+            nn.init.normal_(self.embed_tokens.weight, mean=0, std=self.embed_tokens.weight.size(-1) ** -0.5)
+            nn.init.constant_(self.embed_tokens.weight[PAD_IDX], 0)
         else:
-            self.embedding = embedding
-        self.dropout_layer = nn.Dropout(p=self.dropout)
+            self.embed_tokens = embed_tokens
+        self.dropout = nn.Dropout(p=self.dropout_rate)
 
 
 class MultiheadAttention(nn.Module):
@@ -54,8 +58,17 @@ class MultiheadAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
         self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
         self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.constant_(self.out_proj.bias, 0.0)
+        self.reset_state()
 
-    def forward(self, query, key, value, key_padding_mask=None, attn_mask=None):
+    def reset_state(self):
+        self.state = None
+
+    def forward(self, query, key, value, key_padding_mask=None, attn_mask=None, incremental=False):
         tgt_len, batch_size, embed_dim = query.size()
         q = self.q_proj(query) * self.scaling
         q = q.contiguous().view(tgt_len, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
@@ -65,6 +78,23 @@ class MultiheadAttention(nn.Module):
         v = self.v_proj(value)
         v = v.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
         
+        if incremental and self.state is not None:
+            prev_key = self.state['prev_key']
+            prev_value = self.state['prev_value']
+            prev_key_padding_mask = self.state['prev_key_padding_mask']
+            prev_key = prev_key.view(batch_size * self.num_heads, -1, self.head_dim)
+            prev_value = prev_value.view(batch_size * self.num_heads, -1, self.head_dim)
+            k = torch.cat([prev_key, k], dim=1)
+            v = torch.cat([prev_value, v], dim=1)
+            key_padding_mask = torch.cat([prev_key_padding_mask.float(), key_padding_mask.float()], dim=1)
+
+        if incremental:
+            self.state = {
+                'prev_key': k.view(batch_size, self.num_heads, -1, self.head_dim),
+                'prev_value': v.view(batch_size, self.num_heads, -1, self.head_dim),
+                'prev_key_padding_mask': key_padding_mask,
+            }
+
         src_len = k.size(1)
         attn_weights = torch.bmm(q, k.transpose(1, 2))
 
@@ -98,17 +128,17 @@ class BOW_Encoder(Encoder):
         self.reduce = reduce
         assert(self.reduce in ["sum", "mean", "max"])
         self.activation = nn.ReLU()
-        self.layers = nn.ModuleList([nn.Linear(self.hidden_size, self.hidden_size)])
+        self.layers = nn.ModuleList([nn.Linear(self.embed_dim, self.embed_dim)])
         for _ in range(self.num_layers - 1):
-            self.layers.append(nn.Linear(self.hidden_size, self.hidden_size))
+            self.layers.append(nn.Linear(self.embed_dim, self.embed_dim))
 
     def forward(self, input, input_len, **kwargs):
-        x = self.embedding(input)
+        x = self.embed_tokens(input)
 
         for layer in self.layers:
             x = layer(x)
             x = self.activation(x)
-            x = self.dropout_layer(x)
+            x = self.dropout(x)
         
         mask = torch.arange(input.size(1))[None, :].to(input_len.device) < input_len[:, None]
         x = x * mask.unsqueeze(-1)
@@ -127,20 +157,20 @@ class RNN_Encoder(Encoder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gru = nn.GRU(
-            self.hidden_size, self.hidden_size, num_layers=self.num_layers, batch_first=True,
-            dropout=self.dropout if self.num_layers > 1 else 0
+            self.embed_dim, self.embed_dim, num_layers=self.num_layers, batch_first=True,
+            dropout=self.dropout_rate if self.num_layers > 1 else 0
         )
 
     def forward(self, input, input_len, **kwargs):
         """Return encoded state.
         :param input: (batch_size x seqlen) tensor of token indices.
         """
-        x = self.embedding(input)
-        x = self.dropout_layer(x)
+        x = self.embed_tokens(input)
+        x = self.dropout(x)
         x = torch.nn.utils.rnn.pack_padded_sequence(x, input_len.cpu(), batch_first=True, enforce_sorted=False)
         x, _ = self.gru(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        x = self.dropout_layer(x)
+        x = self.dropout(x)
         return x, {}
 
 
@@ -148,21 +178,24 @@ class RNN_Decoder(Decoder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gru = nn.GRU(
-            self.hidden_size * 2, self.hidden_size, num_layers=self.num_layers, batch_first=True,
-            dropout=self.dropout if self.num_layers > 1 else 0
+            self.embed_dim * 2, self.embed_dim, num_layers=self.num_layers, batch_first=True,
+            dropout=self.dropout_rate if self.num_layers > 1 else 0
         )
-        self.out = nn.Linear(self.hidden_size, self.output_size)
-        self.softmax = nn.LogSoftmax(dim=2)
+        self.out = nn.Linear(self.embed_dim, self.output_size)
+        self.reset_state()
 
-    def forward(self, input, input_len, encoder_output, state=None, **kwargs):
+    def reset_state(self):
+        self.state = None
+
+    def forward(self, input, input_len, encoder_output, incremental=False, **kwargs):
         """Return encoded state.
         :param input: batch_size x tgt_len tensor of token indices.
         """
         bsz = input.size(0)
         tgt_len = input.size(1)
         
-        x = self.embedding(input)       # BxTxH
-        x = self.dropout_layer(x)
+        x = self.embed_tokens(input)       # BxTxH
+        x = self.dropout(x)
 
         if encoder_output.size(1) == 1:
             y = encoder_output
@@ -171,26 +204,23 @@ class RNN_Decoder(Decoder):
         y = y.repeat(1, tgt_len, 1)
         x = torch.cat([x, y], dim=-1)
 
-        output, hidden = self.gru(x, state)
+        output, hidden = self.gru(x, self.state)
+        if incremental:
+            self.state = hidden
         # output: BxTxH
-        scores = self.softmax(self.out(output))
-
-        decoder_results = {
-            'decoder_output': scores,
-            'decoder_state': hidden,
-        }
-        return decoder_results
+        x = self.out(output)
+        return {'decoder_output': x}
 
 
 class AttentionModule(nn.Module):
-    def __init__(self, hidden_size, output_size):
+    def __init__(self, embed_dim, output_size):
         super().__init__()
-        self.l1 = nn.Linear(hidden_size, output_size, bias=False)
-        self.l2 = nn.Linear(hidden_size + output_size, output_size, bias=False)
+        self.l1 = nn.Linear(embed_dim, output_size, bias=False)
+        self.l2 = nn.Linear(embed_dim + output_size, output_size, bias=False)
 
     def forward(self, hidden, encoder_outs, src_lens):
         """
-        hidden: bsz x hidden_size
+        hidden: bsz x embed_dim
         encoder_outs: bsz x sq_len x output_size
         src_lens: bsz
 
@@ -220,26 +250,27 @@ class AttentionDecoder(Decoder):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.gru = nn.GRU(
-            self.hidden_size * 2, self.hidden_size, num_layers=self.num_layers,
-            dropout=self.dropout if self.num_layers > 1 else 0
+            self.embed_dim * 2, self.embed_dim, num_layers=self.num_layers,
+            dropout=self.dropout_rate if self.num_layers > 1 else 0
         )
-        self.out = nn.Linear(self.hidden_size, self.output_size)
-        self.attention = AttentionModule(self.hidden_size, self.hidden_size)
-        self.softmax = nn.LogSoftmax(dim=1)
+        self.out = nn.Linear(self.embed_dim, self.output_size)
+        self.attention = AttentionModule(self.embed_dim, self.embed_dim)
+        self.reset_state()
+    
+    def reset_state(self):
+        self.state = {}
 
-    def forward(self, input, input_len, encoder_output, state=None, **kwargs):
+    def forward(self, input, input_len, encoder_output, incremental=False, **kwargs):
         bsz = input.size(0)
         tgt_len = input.size(1)
         
-        if state:
-            hidden = state['hidden']
-            context = state['context']
-        else:
-            hidden = None
-            context = torch.zeros([bsz, self.hidden_size]).to(input.device)
-        
-        embed = self.embedding(input)
-        embed = self.dropout_layer(embed)
+        hidden = self.state.get('hidden')
+        context = self.state.get('context')
+        if context is None:
+            context = torch.zeros([bsz, self.embed_dim]).to(input.device)
+
+        embed = self.embed_tokens(input)
+        embed = self.dropout(embed)
         embed = embed.transpose(0, 1)
         decoder_output = torch.empty(tgt_len, bsz, self.output_size).to(input.device)
 
@@ -252,38 +283,43 @@ class AttentionDecoder(Decoder):
             x = x.squeeze(0)
             context, attn_weights_ = self.attention(x, encoder_output, input_len)
             out = self.out(context)
-            out = self.softmax(out)
             decoder_output[t] = out
             attn_weights.append(attn_weights_.transpose(0, 1))
 
-        state = {'hidden': hidden, 'context': context}
+        if incremental:
+            self.state = {'hidden': hidden, 'context': context}
 
         decoder_results = {
             'decoder_output': decoder_output.transpose(0, 1).contiguous(),
-            'decoder_state': state,
             'attention_weights': torch.stack(attn_weights, axis=1),
         }
         return decoder_results
 
 
 class TransformerEncoder(Encoder):
-    def __init__(self, *args, heads=4, **kwargs):
+    def __init__(self, *args, heads=4, ffn_dim=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.heads = heads
-        self.embed_positions = PositionalEncoding(self.hidden_size)
+        self.ffn_dim = ffn_dim or self.embed_dim
+        self.embed_positions = PositionalEncoding(self.embed_dim)
         self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
+        self.layer_norm = nn.LayerNorm(self.embed_dim)
+        self.embed_scale = math.sqrt(self.embed_dim)
+        self.dropout = nn.Dropout(self.dropout_rate)
     
     def build_layer(self, layer_id):
-        return TransformerEncoderLayer(self.hidden_size, self.heads, self.dropout)
+        return TransformerEncoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
 
     def forward(self, input, input_len, **kwargs):
-        x = self.embedding(input)
+        x = self.embed_tokens(input) * self.embed_scale
+
         mask = torch.arange(input.size(1))[None, :].to(input_len.device) >= input_len[:, None]
         # shape: (batch_size, src_len)
 
         x = x.transpose(0, 1)   # src_len first
         x += self.embed_positions(x)
-        
+        x = self.dropout(x)
+
         self_attn_weights = []
         for layer in self.layers:
             x, self_attn_weights_ = layer(
@@ -292,77 +328,77 @@ class TransformerEncoder(Encoder):
             )
             self_attn_weights.append(self_attn_weights_)
 
+        x = self.layer_norm(x)
+
         meta = {'self_attention_weights': self_attn_weights}
         return x.transpose(0, 1), meta
 
 
 class TransformerDecoder(Decoder):
-    def __init__(self, *args, heads=4, **kwargs):
+    def __init__(self, *args, heads=4, ffn_dim=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.heads = heads
-        self.embed_positions = PositionalEncoding(self.hidden_size)
+        self.ffn_dim = ffn_dim or self.embed_dim
+        self.embed_positions = PositionalEncoding(self.embed_dim)
         self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
-        self.out = nn.Linear(self.hidden_size, self.output_size)
-        self.softmax = nn.LogSoftmax(dim=2)
+        self.layer_norm = nn.LayerNorm(self.embed_dim)
+        self.embed_scale = math.sqrt(self.embed_dim)
+        self.dropout = nn.Dropout(self.dropout_rate)
+        self.future_mask = torch.empty(0, dtype=torch.bool)
 
     def build_layer(self, layer_id):
-        return TransformerDecoderLayer(self.hidden_size, self.heads, self.dropout)
+        return TransformerDecoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
 
-    def forward(self, input, input_len, encoder_output, state=None, **kwargs):
+    def reset_state(self):
+        self.embed_positions.reset_state()
+        for layer in self.layers:
+            layer.self_attn.reset_state()
+
+    def forward(self, input, input_len, encoder_output, incremental=False, **kwargs):
         """
         input: Tensor of shape (batch_size, tgt_len)
         input_len: Tensor of shape (batch_size,)
-        encoder_output: Tensor of shape (batch_size, src_len, hidden_size)
+        encoder_output: Tensor of shape (batch_size, src_len, embed_dim)
         """
-        x = self.embedding(input)
-        size = encoder_output.size(1)
-        memory_mask = torch.arange(size)[None, :].to(input_len.device) >= input_len[:, None]
+        x = self.embed_tokens(input) * self.embed_scale
+        src_len = encoder_output.size(1)
+        encoder_mask = torch.arange(src_len)[None, :].to(input_len.device) >= input_len[:, None]
+        padding_mask = input.eq(PAD_IDX)
         # shape: (batch_size, src_len)
 
-        if not self.training:
-            tgt_mask = None
-        else:
-            size = input.size(1)
-            tgt_mask = (torch.triu(torch.ones(size, size)) != 1).transpose(0, 1)
-            tgt_mask = tgt_mask.to(input_len.device)   # shape: (tgt_len, tgt_len)
+        tgt_len = input.size(1)
+        if self.future_mask.size(0) < tgt_len:
+            self.future_mask = (torch.triu(torch.ones(tgt_len, tgt_len)) != 1).transpose(0, 1)
+        self.future_mask = self.future_mask.to(x.device)
+        future_mask = self.future_mask[:tgt_len, :tgt_len]
 
         x = x.transpose(0, 1)   # src_len first
         encoder_output = encoder_output.transpose(0, 1)   # src_len first
-        
-        if not self.training and state is not None:
-            start = state[0].size(0)
-        else:
-            start = 0
-        x += self.embed_positions(x, start)
-        
-        if state is None:
-            state = [None] * len(self.layers)
+        x += self.embed_positions(x, incremental=incremental)
+        x = self.dropout(x)
 
         self_attn_weights = []
 
-        for i, layer in enumerate(self.layers):
-            if state[i] is None:
-                state[i] = x
-            else:
-                state[i] = torch.cat([state[i], x], dim=0)
-
+        for layer in self.layers:
             x, self_attn_weights_, attn_weights = layer(
                 x,
                 encoder_output,
-                memory_key_padding_mask=memory_mask,
-                tgt_mask=tgt_mask,
-                prev_states=state[i]
+                padding_mask=padding_mask,
+                encoder_mask=encoder_mask,
+                future_mask=future_mask,
+                incremental=incremental,
             )
             if self.training:
                 attn_weights = self_attn_weights_ = None
 
             self_attn_weights.append(self_attn_weights_)
 
-        scores = self.softmax(self.out(x.transpose(0, 1)))
+        x = self.layer_norm(x)
+        x = x.transpose(0, 1)
+        out = torch.matmul(x, self.embed_tokens.weight.T)
 
         decoder_results = {
-            'decoder_output': scores,
-            'decoder_state': state,
+            'decoder_output': out,
             'attention_weights': attn_weights,
             'self_attention_weights': self_attn_weights
         }
@@ -370,7 +406,8 @@ class TransformerDecoder(Decoder):
 
 
 class EncoderDecoder(nn.Module):
-    def __init__(self, encoder, decoder, lr=1e-3, use_cuda=True, max_len=50, clip=0.3, scheduler=None, scheduler_args=None):
+    def __init__(self, encoder, decoder, lr=1e-3, label_smoothing=0, use_cuda=True, max_len=50, clip=1.0,
+                 scheduler=None, scheduler_args=None):
         super().__init__()
         self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
         self.encoder = encoder.to(self.device)
@@ -378,8 +415,9 @@ class EncoderDecoder(nn.Module):
         self.lr = lr
         self.max_len = max_len
         self.clip = clip
-        self.criterion = nn.NLLLoss(reduction='sum', ignore_index=PAD_IDX)
         scheduler_args = scheduler_args or {}
+        self.criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=PAD_IDX, label_smoothing=label_smoothing)
+
         if scheduler is None:
             self.scheduler_fn = ReduceLROnPlateau
             self.scheduler_args = dict(
@@ -395,7 +433,10 @@ class EncoderDecoder(nn.Module):
             # the scheduler's arguments need to be specified in full (as a dict)
             self.scheduler_fn = scheduler
             self.scheduler_args = scheduler_args
-        self.reset_optimizer()
+        
+        self.optimizer = self.scheduler = None
+        self.epoch = 1
+
         self.START = torch.LongTensor([SOS_IDX]).to(self.device)
         self.metrics = {}
 
@@ -410,6 +451,7 @@ class EncoderDecoder(nn.Module):
     def reset_optimizer(self):
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         self.scheduler = self.scheduler_fn(self.optimizer, **self.scheduler_args)
+        self.epoch = 1
 
     def vec2txt(self, vector):
         """
@@ -438,11 +480,11 @@ class EncoderDecoder(nn.Module):
         references = []
 
         for data in batch_iterator:
-            hypotheses += self.decoding_step(data)[0]
+            hyps = self.decoding_step(data)[0]
+            if detokenize is not None:
+                hyps = [detokenize(hyp) for hyp in hyps]
+            hypotheses += hyps
             references += data['reference']
-
-        if detokenize is not None:
-            hypotheses = [detokenize(line) for line in hypotheses]
 
         chrf = sacrebleu.corpus_chrf(hypotheses, [references])
         translation_output = namedtuple('translation_output', ['score', 'output'])
@@ -453,6 +495,9 @@ class EncoderDecoder(nn.Module):
 
         if input is None:
             return
+
+        if train and self.optimizer is None:
+            self.reset_optimizer()
 
         input = input.to(self.device)
         target = target.to(self.device)
@@ -491,6 +536,7 @@ class EncoderDecoder(nn.Module):
 
         return loss.item()
 
+    @torch.no_grad()
     def eval_step(self, batch):
         return self.train_step(batch, train=False)
 
@@ -501,18 +547,22 @@ class EncoderDecoder(nn.Module):
     def update_params(self):
         """Do one optimization step."""
         if self.clip is not None:
-            torch.nn.utils.clip_grad_norm_(
-                self.encoder.parameters(), self.clip)
-            torch.nn.utils.clip_grad_norm_(
-                self.decoder.parameters(), self.clip)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip)
         self.optimizer.step()
 
-    def scheduler_step(self, val_score=None):
-        if isinstance(self.scheduler, ReduceLROnPlateau):
-            self.scheduler.step(val_score)
-        else:
+    def scheduler_step(self, score=None, end_of_epoch=True):
+        if end_of_epoch:
+            self.epoch += 1
+            
+            if isinstance(self.scheduler, ReduceLROnPlateau):
+                self.scheduler.step(score)
+            elif not isinstance(self.scheduler, WarmupLR):
+                self.scheduler.step()
+        
+        elif isinstance(self.scheduler, WarmupLR):
             self.scheduler.step()
 
+    @torch.no_grad()
     def decoding_step(self, batch):
         input, input_len = batch['source'], batch['source_len']
 
@@ -523,17 +573,25 @@ class EncoderDecoder(nn.Module):
         input_len = input_len.to(self.device)
 
         bsz = input.size(0)
-        starts = self.START.expand(bsz, 1)  # expand to batch size
+        bos = self.START.expand(bsz, 1)  # expand to batch size
+        prefix = batch.get('prefix')
+
+        if prefix is None:
+            prefix = bos
+        else:
+            prefix = prefix.to(self.device)
+            prefix = torch.cat([bos, prefix], dim=1)
+
         self.encoder.eval()
         self.decoder.eval()
         encoder_output, meta = self.encoder(input, input_len=input_len)
+
         encoder_self_attn = meta.get('self_attention_weights')
 
         predictions = []
         done = [False for _ in range(bsz)]
         total_done = 0
-        decoder_input = starts
-        decoder_state = None
+        decoder_input = prefix
         attn_weights = []
 
         for _ in range(self.max_len):
@@ -542,15 +600,15 @@ class EncoderDecoder(nn.Module):
                 input=decoder_input,
                 input_len=input_len,
                 encoder_output=encoder_output,
-                state=decoder_state,
+                incremental=True,
             )
 
             decoder_output = decoder_results['decoder_output']
-            decoder_state = decoder_results.get('decoder_state')
             attn_weights_ = decoder_results.get('attention_weights')
 
-            _, preds = decoder_output.max(2)
-            predictions.append(preds)
+            _, preds = decoder_output.max(dim=2)
+            preds = preds[:,-1:]
+            predictions.append(preds.cpu())
             decoder_input = preds  # set input to next step
 
             attn_weights.append(attn_weights_)
@@ -559,13 +617,16 @@ class EncoderDecoder(nn.Module):
             for b in range(bsz):
                 if not done[b]:
                     # only add more tokens for examples that aren't done
-                    if preds[b].item() == EOS_IDX:
+                    if preds[b][-1] == EOS_IDX:
                         # if we produced END, we're done
                         done[b] = True
                         total_done += 1
             if total_done == bsz:
                 # no need to generate any more
                 break
+        
+        self.decoder.reset_state()
+        
         predictions = torch.cat(predictions, 1)
         
         attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1)
@@ -573,10 +634,24 @@ class EncoderDecoder(nn.Module):
 
     def load(self, path, strict=True, reset_optimizer=False):
         if os.path.isfile(path):
-            ckpt = torch.load(path)
-            self.load_state_dict(ckpt['model'], strict=strict)
-            self.reset_optimizer()
-            if not reset_optimizer:
+            ckpt = torch.load(path, map_location='cpu')
+            model = ckpt['model']
+
+            # Parameters that are sometimes present in fairseq checkpoints and that we don't need:
+            model.pop('encoder.embed_positions._float_tensor', None)
+            model.pop('decoder.embed_positions._float_tensor', None)
+            model.pop('encoder.version', None)
+            model.pop('decoder.version', None)
+
+            if 'decoder.embed_tokens.weight' not in model:
+                model['decoder.embed_tokens.weight'] = model['encoder.embed_tokens.weight']
+            
+            self.load_state_dict(model, strict=strict)
+            
+            if reset_optimizer and self.optimizer is not None:
+                self.reset_optimizer()
+            elif not reset_optimizer:
+                self.reset_optimizer()
                 if ckpt.get('scheduler'):
                     state_dict = ckpt['scheduler']
                     state_dict.pop('best', None)  # scores won't be comparable if we change valid set
@@ -585,6 +660,8 @@ class EncoderDecoder(nn.Module):
                     self.optimizer.load_state_dict(ckpt['optimizer'])
                 if ckpt.get('metrics'):
                     self.metrics = ckpt['metrics']
+                if ckpt.get('epoch'):
+                    self.epoch = ckpt['epoch']
 
     def save(self, path):
         dirname = os.path.dirname(path)
@@ -595,102 +672,102 @@ class EncoderDecoder(nn.Module):
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict(),
             'metrics': self.metrics,
+            'epoch': self.epoch,
         }
         torch.save(ckpt, path)
 
     def record(self, name, value):
         self.metrics.setdefault(self.epoch, {})[name] = value
 
-    @property
-    def epoch(self):
-        return self.scheduler.last_epoch
-
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
+    def __init__(self, embed_dim, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.self_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
-        self.linear1 = nn.Linear(hidden_size, ffn_dim or hidden_size)
+        self.embed_dim = embed_dim
+        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim)
+        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(ffn_dim or hidden_size, hidden_size)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
+        self.final_layer_norm = nn.LayerNorm(embed_dim)
         self.activation = activation
     
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         x = src
         residual = x
+        x = self.self_attn_layer_norm(x)
         x, _, self_attn_weights_all_heads = self.self_attn(
             x, x, x, attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask)
-        x = residual + self.dropout1(x)
-        x = self.norm1(x)
+        x = residual + self.dropout(x)
         residual = x
-        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = residual + self.dropout2(x)
-        x = self.norm2(x)
+        x = self.final_layer_norm(x)
+        x = self.fc2(self.dropout(self.activation(self.fc1(x))))
+        x = residual + self.dropout(x)
         return x, self_attn_weights_all_heads
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, hidden_size, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
+    def __init__(self, embed_dim, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
         super().__init__()
-        self.hidden_size = hidden_size
-        self.self_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
-        self.multihead_attn = MultiheadAttention(hidden_size, num_heads, dropout=dropout)
-        self.linear1 = nn.Linear(hidden_size, ffn_dim or hidden_size)
+        self.embed_dim = embed_dim
+        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.encoder_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim)
+        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim)
         self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(ffn_dim or hidden_size, hidden_size)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.norm3 = nn.LayerNorm(hidden_size)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
+        self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
+        self.encoder_attn_layer_norm = nn.LayerNorm(embed_dim)
+        self.final_layer_norm = nn.LayerNorm(embed_dim)
         self.activation = activation
 
-    def forward(self, tgt, memory, tgt_mask=None, memory_mask=None,
-                tgt_key_padding_mask=None, memory_key_padding_mask=None, prev_states=None):
+    def forward(self, tgt, memory, future_mask=None, memory_mask=None,
+                padding_mask=None, encoder_mask=None, incremental=False):
         x = tgt
         residual = x
-        if prev_states is None:
-            prev_states = x
+        x = self.self_attn_layer_norm(x)
         x, _, self_attn_weights_all_heads = self.self_attn(
-            x, prev_states, prev_states, attn_mask=tgt_mask,
-            key_padding_mask=tgt_key_padding_mask)
-        x = residual + self.dropout1(x)
-        x = self.norm1(x)
+            x, x, x, attn_mask=future_mask,
+            key_padding_mask=padding_mask, incremental=incremental)
+        x = residual + self.dropout(x)
 
         residual = x
-        x, attn_weights, attn_weights_all_heads = self.multihead_attn(
+        x = self.encoder_attn_layer_norm(x)
+        x, attn_weights, attn_weights_all_heads = self.encoder_attn(
             x, memory, memory, attn_mask=memory_mask,
-            key_padding_mask=memory_key_padding_mask)
-        x = residual + self.dropout2(x)
-        x = self.norm2(x)
+            key_padding_mask=encoder_mask)
+        x = residual + self.dropout(x)
 
         residual = x
-        x = self.linear2(self.dropout(self.activation(self.linear1(x))))
-        x = residual + self.dropout3(x)
-        x = self.norm3(x)
+        x = self.final_layer_norm(x)
+        x = self.fc2(self.dropout(self.activation(self.fc1(x))))
+        x = residual + self.dropout(x)
 
         return x, self_attn_weights_all_heads, attn_weights
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=128):
+    def __init__(self, embed_dim, max_len=128):
         super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.pe = pe.unsqueeze(0).transpose(0, 1)
+        max_len += PAD_IDX + 1   # like in fairseq
+        half_dim = embed_dim // 2
+        weight = math.log(10000) / (half_dim - 1)
+        weight = torch.exp(torch.arange(half_dim, dtype=torch.float) * -weight)
+        weight = torch.arange(max_len, dtype=torch.float).unsqueeze(1) * weight.unsqueeze(0)
+        weight = torch.cat([torch.sin(weight), torch.cos(weight)], dim=1).view(max_len, -1)
+        weight[PAD_IDX, :] = 0
+        self.weight = weight.unsqueeze(0).transpose(0, 1)
+        self.reset_state()
 
-    def forward(self, x, start=0):
-        return x + self.pe[start:start + x.size(0), :].to(x.device)
+    def reset_state(self):
+        self.state = PAD_IDX + 1
+
+    def forward(self, x, incremental=False):
+        length = x.size(0)
+        x = self.weight[self.state:self.state + length, :].to(x.device)
+        if incremental:
+            self.state += length
+        return x
 
 
 class AdapterLayer(nn.Module):
@@ -716,7 +793,7 @@ class AdapterTransformerEncoderLayer(TransformerEncoderLayer):
     def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.adapters = nn.ModuleDict({
-            id: AdapterLayer(self.hidden_size, projection_dim)
+            id: AdapterLayer(self.embed_dim, projection_dim)
             for id in adapter_ids
         })
         self.adapter_id = None
@@ -745,9 +822,9 @@ class AdapterTransformerEncoder(TransformerEncoder):
         return AdapterTransformerEncoderLayer(
             self.adapter_ids,
             self.projection_dim,
-            self.hidden_size,
+            self.embed_dim,
             self.heads,
-            self.dropout
+            self.dropout_rate,
         )
 
 
@@ -755,7 +832,7 @@ class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
     def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.adapters = nn.ModuleDict({
-            id: AdapterLayer(self.hidden_size, projection_dim)
+            id: AdapterLayer(self.embed_dim, projection_dim)
             for id in adapter_ids
         })
         self.adapter_id = None
@@ -784,26 +861,22 @@ class AdapterTransformerDecoder(TransformerDecoder):
         return AdapterTransformerDecoderLayer(
             self.adapter_ids,
             self.projection_dim,
-            self.hidden_size,
+            self.embed_dim,
             self.heads,
-            self.dropout
+            self.dropout_rate,
         )
 
 
 class WarmupLR(torch.optim.lr_scheduler._LRScheduler):
-    @staticmethod
-    def add_args(parser):
-        parser.add_argument('--warmup', type=int, default=1000)
-        parser.add_argument('--init-lr', type=float, default=0.0)
-
-    def __init__(self, args, optimizer, last_epoch=-1, verbose=False):
-        self.warmup = args.warmup
-        self.init_lr = args.init_lr
+    def __init__(self, optimizer, last_epoch=-1, warmup=1000, init_lr=0.0, verbose=False):
+        self.warmup = warmup
+        self.init_lr = init_lr
+        param_group = next(iter(optimizer.param_groups))
+        self.lr = param_group.get('initial_lr', param_group['lr'])
         if self.init_lr < 0:
-            self.init_lr = 0 if self.warmup > 0 else args.lr
-
-        self.lr_step = (args.lr - self.init_lr) / self.warmup
-        self.decay_factor = args.lr * self.warmup ** 0.5
+            self.init_lr = 0 if self.warmup > 0 else self.lr
+        self.lr_step = (self.lr - self.init_lr) / self.warmup
+        self.decay_factor = self.lr * self.warmup ** 0.5
         super(WarmupLR, self).__init__(optimizer, last_epoch, verbose)
 
     def get_lr(self):

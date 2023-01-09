@@ -8,8 +8,7 @@ source env/bin/activate
 
 pip install torch
 pip install jupyter
-pip install subword_nmt
-pip install sacremoses
+pip install sentencepiece
 pip install googletrans==3.1.0a0
 pip install pandas
 pip install sacrebleu

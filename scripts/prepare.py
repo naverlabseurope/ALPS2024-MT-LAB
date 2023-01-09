@@ -2,7 +2,6 @@
 
 import os
 import argparse
-import sacremoses
 import random
 import requests
 import io
@@ -22,17 +21,15 @@ test_size = 2000
 valid_size = 2000
 
 args.langs = sorted(set(args.langs))
-tokenizers = {lang: sacremoses.MosesTokenizer(lang=lang) for lang in args.langs + ['en']}
 
 def preprocess(line, lang):
-    tokenizer = tokenizers[lang]
-    return tokenizer.tokenize(line.strip(), escape=False, return_str=True).lower()
-    # return ' '.join(line.split()).lower()
+    return ' '.join(line.split())
+
 
 def read_corpus(src_lang, tgt_lang='en'):
     assert src_lang != tgt_lang
     pair = '-'.join(sorted([src_lang, tgt_lang]))
-    url = f'https://opus.nlpl.eu/download.php?f=Tatoeba/v2021-07-22/moses/{pair}.txt.zip'
+    url = f'https://opus.nlpl.eu/download.php?f=Tatoeba/v2022-03-03/moses/{pair}.txt.zip'
     src_filename = f'Tatoeba.{pair}.{src_lang}'
     tgt_filename = f'Tatoeba.{pair}.{tgt_lang}'
     print(f'Downloading {pair} data from {url}')
@@ -50,7 +47,7 @@ def read_corpus(src_lang, tgt_lang='en'):
 
 corpora = {lang: read_corpus(lang) for lang in args.langs}
 
-print(f'Creating splits in {args.data_dir}')
+print(f"Creating splits in '{args.data_dir}'")
 os.makedirs(args.data_dir, exist_ok=True)
 
 en_lines = list(corpora.values())

@@ -5,8 +5,22 @@ import os
 
 import torch
 
-SPECIAL_SYMBOLS = SOS_TOKEN, EOS_TOKEN, UNK_TOKEN, PAD_TOKEN = '<sos>', '<eos>', '<unk>', '<pad>'
-SOS_IDX, EOS_IDX, UNK_IDX, PAD_IDX = range(4)
+SPECIAL_SYMBOLS = SOS_TOKEN, PAD_TOKEN, EOS_TOKEN, UNK_TOKEN = '<sos>', '<pad>', '<eos>', '<unk>'
+SOS_IDX = EOS_IDX = 2    # like in fairseq
+PAD_IDX = 1
+UNK_IDX = 3
+
+
+class Tokenizer:
+    def __init__(self, model_path):
+        import sentencepiece as spm
+        self.model = spm.SentencePieceProcessor()
+        self.model.Load(model_path)
+        pass
+    def tokenize(self, line):
+        return ' '.join(self.model.encode_as_pieces(line))
+    def detokenize(self, line):
+        return line.replace(' ', '').replace('▁', ' ').strip()
 
 
 class Dictionary:
@@ -165,7 +179,7 @@ def concatenate_datasets(datasets):
 
 
 class BatchIterator:
-    def __init__(self, data, source_lang, target_lang, batch_size, max_len, shuffle=True):
+    def __init__(self, data, source_lang, target_lang, batch_size, max_len, shuffle=True, prefix_len=0):
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.data = data
@@ -173,31 +187,35 @@ class BatchIterator:
         batches = []
         batch = []
         
-        size = 0
+        sample_size = 0
+        
         for idx in range(len(data)):
             sample = {
                 'source': data.iloc[idx]['source_bin'],
                 'target': data.iloc[idx]['target_bin'],
                 'reference': data.iloc[idx]['target_data'],
+                'prefix': data.iloc[idx]['target_data'][:prefix_len],
             }
 
-            sample_size = max(len(sample['source']), len(sample['target']))
-
-            if sample_size > batch_size:
+            size = max(len(sample['source']), len(sample['target']))
+            
+            if size > batch_size:
                 continue
-            elif size + sample_size > batch_size:
+
+            sample_size = max(sample_size, size)
+
+            if sample_size * (len(batch) + 1) > batch_size:
                 batches.append(batch)
                 batch = [sample]
-                size = sample_size
+                sample_size = size
             else:
                 batch.append(sample)
-                size += sample_size
 
         if batch:
             batches.append(batch)
 
         self.batches = [
-            collate(batch, max_len, source_lang, target_lang)
+            collate(batch, max_len, source_lang, target_lang, prefix_len=prefix_len)
             for batch in batches
         ]
         self.shuffle = shuffle
@@ -227,7 +245,9 @@ class MultilingualBatchIterator(BatchIterator):
         self.target_lang = 'tgt'
 
 
-def collate(batch, max_len, source_lang, target_lang):
+def collate(batch, max_len, source_lang, target_lang, prefix_len=0):
+    # This function takes a batch containing samples of varying lengths and concatenates these samples 
+    # into same length sequences by padding them to the maximum length
     source = [sample['source'] for sample in batch]
     target = [sample['target'] for sample in batch]
     reference = [sample['reference'] for sample in batch]
@@ -235,9 +255,13 @@ def collate(batch, max_len, source_lang, target_lang):
     max_target_len = min(max(map(len, target)), max_len)
 
     def pad(seq, max_len):
-        seq = np.array(seq)[:max_len]
+        seq = np.array(seq)
         seq_len = len(seq)
-        if seq_len < max_len:
+        if seq_len > max_len:
+            # truncate but keep the EOS token
+            seq = np.concatenate([seq[:max_len - 1], seq[-1:]])
+            seq_len = len(seq)
+        elif seq_len < max_len:
             seq = np.pad(
                 seq,
                 pad_width=(0, max_len - seq_len),
@@ -247,8 +271,8 @@ def collate(batch, max_len, source_lang, target_lang):
 
     source, source_len = zip(*[pad(x, max_source_len) for x in source])
     target, target_len = zip(*[pad(x, max_target_len) for x in target])
-
-    return {
+    
+    batch = {
         'source': np.array(source),
         'target': np.array(target),
         'source_len': np.array(source_len),
@@ -257,3 +281,7 @@ def collate(batch, max_len, source_lang, target_lang):
         'target_lang': target_lang,
         'reference': reference,
     }
+    if prefix_len > 0:
+        batch['prefix'] = batch['target'][:,:prefix_len]
+        assert batch['prefix'].shape[1] == prefix_len
+    return batch

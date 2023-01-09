@@ -7,8 +7,7 @@ import data
 import numpy as np
 import torch
 import time
-import numpy as np
-from subword_nmt.apply_bpe import BPE
+import json
 
 import argparse
 
@@ -23,11 +22,12 @@ parser.add_argument('--lang-pairs', nargs='+',
                     'If there are more than one target language, source-side language codes will automatically be added.')
 parser.add_argument('--source-dict', help='Path to the source dictionary. Default: dict.SRC.txt in the same directory as the checkpoint')
 parser.add_argument('--target-dict', help='Path to the target dictionary. Default: dict.TGT.txt in the same directory as the checkpoint')
-parser.add_argument('--bpecodes', help='Path to the BPE model. Default: DATA_DIR/bpecodes.de-en-fr')
+parser.add_argument('--bpe-path', help='Path to the BPE model. Default: DATA_DIR/spm.de-en-fr.model')
 parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs. Default: 10')
 parser.add_argument('--encoder-layers', type=int, default=1, help='Number of encoder layers. Default: 1')
 parser.add_argument('--decoder-layers', type=int, default=1, help='Number of decoder layers. Default: 1')
-parser.add_argument('--hidden-size', type=int, default=512, help='Hidden size and embedding size of the model. Default: 512')
+parser.add_argument('--embed-dim', type=int, default=512, help='Embedding dimension of the model. Default: 512')
+parser.add_argument('--ffn-dim', type=int, help='Feed-forward dimension of the Transformer, if different than --embed-dim')
 parser.add_argument('--max-size', type=int, help='Maximum number of training examples. Default: all')
 parser.add_argument('--max-len', type=int, default=30, help='Maximum number of tokens per line (longer sequences will be truncated). Default: 30')
 parser.add_argument('--data-dir', default='data', metavar='DATA_DIR', help='Directory containing the training data. Default: data')
@@ -42,13 +42,16 @@ parser.add_argument('--shared-embeddings', action='store_true',
                     ' and share the encoder and decoder embedding matrices')
 parser.add_argument('--model-type', choices=['bow', 'rnn', 'rnn_attn', 'transformer'], default='transformer',
                     help='which model architecture to use')
-
+parser.add_argument('--warmup', type=int, help='Use an inverse square root warmup schedule with this number of warmup '
+                    'steps. Default: Reduce LR on plateau')
+parser.add_argument('--scheduler-args', help='Serialized json dict containing additional arguments for the scheduler')
+parser.add_argument('--label-smoothing', type=float, default=0, help='Amount of label smoothing. Default: 0')
 
 args = parser.parse_args()
 print(args)
 
 model_dir = os.path.dirname(args.checkpoint_path)
-bpe_path = args.bpecodes or os.path.join(args.data_dir, 'bpecodes.de-en-fr')
+bpe_path = args.bpe_path or os.path.join(args.data_dir, 'spm.de-en-fr.model')
 
 if args.lang_pairs:
     lang_pairs = [tuple(lang_pair.split('-')) for lang_pair in args.lang_pairs]
@@ -80,13 +83,12 @@ def reset_seed(seed=1234):
     torch.manual_seed(seed)
 
 
-with open(bpe_path) as bpe_codes:
-    bpe_model = BPE(bpe_codes)
+tokenizer = data.Tokenizer(bpe_path)
 
 
 def preprocess(source_line, target_line, source_lang=None, target_lang=None):
-    source_line = bpe_model.segment(source_line.lower())
-    target_line = bpe_model.segment(target_line.lower())
+    source_line = tokenizer.tokenize(source_line)
+    target_line = tokenizer.tokenize(target_line)
 
     if len(target_langs) > 1:
         source_line = f'<lang:{target_lang}> {source_line}'
@@ -94,7 +96,7 @@ def preprocess(source_line, target_line, source_lang=None, target_lang=None):
 
 
 def postprocess(line):
-    return line.replace('@@ ', '')
+    return tokenizer.detokenize(line)
 
 
 def load_data(source_lang, target_lang, split='train', max_size=None):
@@ -168,7 +170,7 @@ else:
     train_iterator = train_iterators[0]
 
 
-def evaluate_model(test_or_valid_iterators, model, record=False):
+def evaluate_model(model, test_or_valid_iterators, record=False):
     """
     valid_iterators: list of data.BatchIterator
     model: instance of models.EncoderDecoder
@@ -216,31 +218,33 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
     reset_seed()
 
     if model.epoch >= epochs:
-        evaluate_model(valid_iterators, model, record=False)
+        evaluate_model(model, valid_iterators, record=False)
         return
     
     start = time.time()
 
     best_score = -1
-    for epoch in range(model.epoch + 1, epochs + 1):
+    while model.epoch <= epochs:
 
         start_ = time.time()
         running_loss = 0
 
-        print(f'Epoch [{epoch}/{epochs}]')
+        print(f'Epoch [{model.epoch}/{epochs}]')
 
         # Iterate over training batches for one epoch
         for i, batch in enumerate(train_iterator, 1):
+            running_loss += model.train_step(batch)
+            model.scheduler_step(end_of_epoch=False)
             if args.verbose:
                 sys.stderr.write(
-                    "\r{}/{}, wall={:.2f}, loss={:.3f}".format(
+                    "\r{}/{}, wall={:.2f}, loss={:.3f}, lr={:.4e}".format(
                         i,
                         len(train_iterator),
                         time.time() - start_,
                         running_loss / i,
+                        model.optimizer.param_groups[0]['lr'],
                     )
                 )
-            running_loss += model.train_step(batch)
 
         if args.verbose:
             sys.stderr.write('\n')
@@ -251,11 +255,11 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
         print(f"loss={epoch_loss:.3f}, time={time.time() - start_:.2f}")
         model.record('train_loss', epoch_loss)
 
-        score = evaluate_model(valid_iterators, model, record=True)
+        score = evaluate_model(model, valid_iterators, record=True)
 
         # Update the model's learning rate based on current performance.
         # This scheduler divides the learning rate by 10 if chrF does not improve.
-        model.scheduler_step(score)
+        model.scheduler_step(score=score, end_of_epoch=True)
 
         # Save a model checkpoint if it has the best validation chrF so far
         if score > best_score:
@@ -269,15 +273,17 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
 
 encoder_args = dict(
     source_dict=source_dict,
-    hidden_size=args.hidden_size,
+    embed_dim=args.embed_dim,
     num_layers=args.encoder_layers,
     dropout=args.dropout,
+    ffn_dim=args.ffn_dim or args.embed_dim,
 )
 decoder_args = dict(
     target_dict=target_dict,
-    hidden_size=args.hidden_size,
+    embed_dim=args.embed_dim,
     num_layers=args.decoder_layers,
     dropout=args.dropout,
+    ffn_dim=args.ffn_dim or args.embed_dim,
 )
 
 if args.model_type == 'bow':
@@ -294,19 +300,30 @@ else:
     decoder = models.TransformerDecoder(**decoder_args, heads=args.heads)
 
 if args.shared_embeddings:
-    decoder.embedding = encoder.embedding
+    decoder.embed_tokens = encoder.embed_tokens
+
+scheduler_args = json.loads(args.scheduler_args) if args.scheduler_args else {}
+if args.warmup:
+    scheduler_args['warmup'] = args.warmup
 
 model = models.EncoderDecoder(
     encoder,
     decoder,
     lr=args.lr,
+    label_smoothing=args.label_smoothing,
     use_cuda=not args.cpu,
+    scheduler=models.WarmupLR if args.warmup else None,
+    scheduler_args=scheduler_args,
+    clip=1.0,
 )
+
+num_params = sum(p.numel() for p in model.parameters())
+print(f'total model parameters: {num_params}')
 
 if not args.reset:
     model.load(args.checkpoint_path)
 
-if model.epoch > 0:
+if model.epoch > 1:
     print(f'resumed checkpoint {args.checkpoint_path} ({model.epoch} epochs)')
 else:
     print(f'new model checkpoint: {args.checkpoint_path}')
