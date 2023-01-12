@@ -33,6 +33,15 @@ def benchmark():
     print(f'Time elapsed: {elapsed:.1f} sec, GPU memory usage: {mem / 2**20:.1f}MiB')
 
 
+def free_gpu_memory():
+    """ Move all models to the CPU to free GPU memory """
+    global_variables = globals()
+    for k, v in global_variables.items():
+        if isinstance(v, EncoderDecoder):
+            v.cpu()
+    torch.cuda.empty_cache()
+
+
 class Encoder(nn.Module):
     def __init__(self, source_dict, embed_dim=512, num_layers=1, dropout=0, **kwargs):
         super().__init__()
@@ -564,37 +573,45 @@ class EncoderDecoder(nn.Module):
         return self.vec2txt(predictions), attn   # , encoder_self_attn
 
     def load(self, path, strict=True, reset_optimizer=False):
-        if os.path.isfile(path):
-            ckpt = torch.load(path, map_location='cpu')
-            model = ckpt['model']
+        if not os.path.isfile(path):
+            return
+        
+        ckpt = torch.load(path, map_location='cpu')
+        model = ckpt['model']
 
-            # Parameters that are sometimes present in fairseq checkpoints and that we don't need:
-            model.pop('encoder.embed_positions._float_tensor', None)
-            model.pop('decoder.embed_positions._float_tensor', None)
-            model.pop('encoder.version', None)
-            model.pop('decoder.version', None)
+        # Parameters that are sometimes present in fairseq checkpoints and that we don't need:
+        model.pop('encoder.embed_positions._float_tensor', None)
+        model.pop('decoder.embed_positions._float_tensor', None)
+        model.pop('encoder.version', None)
+        model.pop('decoder.version', None)
 
-            if 'decoder.embed_tokens.weight' not in model:
-                model['decoder.embed_tokens.weight'] = model['encoder.embed_tokens.weight']
-            
-            self.load_state_dict(model, strict=strict)
-            
-            if reset_optimizer and self.optimizer is not None:
-                self.reset_optimizer()
-            elif not reset_optimizer:
-                self.reset_optimizer()
-                if ckpt.get('scheduler'):
-                    state_dict = ckpt['scheduler']
-                    state_dict.pop('best', None)  # scores won't be comparable if we change valid set
-                    self.scheduler.load_state_dict(state_dict)
-                if ckpt.get('optimizer'):
-                    self.optimizer.load_state_dict(ckpt['optimizer'])
-                if ckpt.get('scaler'):
-                    self.scaler.load_state_dict(ckpt['scaler'])
-                if ckpt.get('metrics'):
-                    self.metrics = ckpt['metrics']
-                if ckpt.get('epoch'):
-                    self.epoch = ckpt['epoch']
+        if 'decoder.embed_tokens.weight' not in model:
+            model['decoder.embed_tokens.weight'] = model['encoder.embed_tokens.weight']
+        
+        for k, v in self.state_dict().items():
+            # automatically add random adapter parameters to the model checkpoint to
+            # avoid any error when initializing adapter models
+            if k not in model and 'adapters' in k.split('.'):
+                model[k] = v
+
+        self.load_state_dict(model, strict=strict)
+        
+        if reset_optimizer and self.optimizer is not None:
+            self.reset_optimizer()
+        elif not reset_optimizer:
+            self.reset_optimizer()
+            if ckpt.get('scheduler'):
+                state_dict = ckpt['scheduler']
+                state_dict.pop('best', None)  # scores won't be comparable if we change valid set
+                self.scheduler.load_state_dict(state_dict)
+            if ckpt.get('optimizer'):
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+            if ckpt.get('scaler'):
+                self.scaler.load_state_dict(ckpt['scaler'])
+            if ckpt.get('metrics'):
+                self.metrics = ckpt['metrics']
+            if ckpt.get('epoch'):
+                self.epoch = ckpt['epoch']
 
     def save(self, path):
         dirname = os.path.dirname(path)

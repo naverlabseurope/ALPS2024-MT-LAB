@@ -20,6 +20,7 @@ class Tokenizer:
         return ' '.join(self.model.encode_as_pieces(word))
     @functools.lru_cache(maxsize=10**6)  # to speed up tokenization of already seen sentences
     def tokenize(self, line):
+        line = line or ''  # to also work with None
         return ' '.join(self._tokenize(word) for word in line.split())
     def detokenize(self, line):
         return line.replace(' ', '').replace('▁', ' ').strip()
@@ -74,7 +75,7 @@ class Dictionary:
         indices = [self.index(token) for token in sentence.split()]
         if add_eos:
             indices.append(EOS_IDX)
-        return np.array(indices, dtype=np.int32)
+        return np.array(indices, dtype=np.int64)
 
     def save(self, path):
         dirname = os.path.dirname(path)
@@ -86,7 +87,7 @@ class Dictionary:
             )
     
     @staticmethod
-    def load(path, minimum_count=10):
+    def load(path, minimum_count=0):
         dictionary = Dictionary(minimum_count)
 
         with open(path, 'r') as f:
@@ -98,14 +99,12 @@ class Dictionary:
 
 
 def binarize(dataset, source_dict, target_dict, sort=True):
-    for key in 'source', 'target':
+    for key in 'source', 'target', 'prefix':
         dictionary = source_dict if key == 'source' else target_dict
 
         indices = []
         for tokens in dataset[key + '_tokenized']:
-            indices.append(
-                [dictionary.index(token) for token in tokens] + [EOS_IDX]
-            )
+            indices.append(dictionary.txt2vec(tokens, add_eos=(key != 'prefix')))
 
         dataset[key + '_bin'] = indices
         dataset[key + '_len'] = dataset[key + '_bin'].apply(len) 
@@ -126,8 +125,8 @@ def load_or_create_dictionary(dict_path, dataset, reset=False):
         dictionary = Dictionary.load(dict_path)
     else:
         dictionary = Dictionary()
-        for tokens in dataset:
-            for token in tokens:
+        for line in dataset:
+            for token in line.split():
                 dictionary.add_symbol(token, count=1)
         dictionary.save(dict_path)
 
@@ -139,15 +138,20 @@ def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None)
 
     def preprocess_and_split(source_line, target_line):
         if preprocess is not None:
-            tok_pair = preprocess(
+            out = preprocess(
                 source_line, target_line,
                 source_lang=source_lang,
                 target_lang=target_lang
             )
-            if not tok_pair:
+            
+            if not out:
                 return None
-            source_line, target_line = tok_pair
-        return source_line.split(), target_line.split()
+            
+            source_line, target_line, *prefix = out
+            # preprocess can return (source, target) or (source, target, prefix)
+            prefix = prefix[0] if prefix else None
+        
+        return source_line, target_line, prefix
 
     with open(f'{path}.{source_lang}') as source_file, open(f'{path}.{target_lang}') as target_file:
         source_data = []
@@ -155,6 +159,7 @@ def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None)
 
         source_tokenized = []
         target_tokenized = []
+        prefix_tokenized = []
         
         for source_line, target_line in zip(source_file, target_file):
             # if filter_fn is None or filter_fn(source_line, target_line):
@@ -162,11 +167,12 @@ def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None)
             tok_pair = preprocess_and_split(source_line, target_line)
             if not tok_pair:   # if 'preprocess' returns None, this means that we filter out this example
                 continue
-            src_tok, tgt_tok = tok_pair
+            src_tok, tgt_tok, prefix = tok_pair
             source_data.append(source_line)
             target_data.append(target_line)
             source_tokenized.append(src_tok)
             target_tokenized.append(tgt_tok)
+            prefix_tokenized.append(prefix)
 
             if max_size and len(source_data) == max_size:
                 break
@@ -175,6 +181,7 @@ def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None)
         dataset['target_data'] = target_data
         dataset['source_tokenized'] = source_tokenized
         dataset['target_tokenized'] = target_tokenized
+        dataset['prefix_tokenized'] = prefix_tokenized
 
     return dataset
 
@@ -184,7 +191,7 @@ def concatenate_datasets(datasets):
 
 
 class BatchIterator:
-    def __init__(self, data, source_lang, target_lang, batch_size, max_len, shuffle=True, prefix_len=0):
+    def __init__(self, data, source_lang, target_lang, batch_size, max_len, shuffle=True):
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.data = data
@@ -199,7 +206,7 @@ class BatchIterator:
                 'source': data.iloc[idx]['source_bin'],
                 'target': data.iloc[idx]['target_bin'],
                 'reference': data.iloc[idx]['target_data'],
-                'prefix': data.iloc[idx]['target_data'][:prefix_len],
+                'prefix': data.iloc[idx]['prefix_bin'],
             }
 
             size = max(len(sample['source']), len(sample['target']))
@@ -219,7 +226,7 @@ class BatchIterator:
         if batch:
             batches.append(batch)
 
-        self.batches = [collate(batch, max_len, prefix_len=prefix_len) for batch in batches]
+        self.batches = [collate(batch, max_len) for batch in batches]
         self.shuffle = shuffle
 
     def __len__(self):
@@ -243,11 +250,15 @@ class MultilingualBatchIterator(BatchIterator):
         self.target_lang = 'tgt'
 
 
-def collate(batch, max_len, prefix_len=0):
+def collate(batch, max_len):
     # This function takes a batch containing samples of varying lengths and concatenates these samples 
     # into same length sequences by padding them to the maximum length
-    source = [sample['source'] for sample in batch]
-    target = [sample['target'] for sample in batch]
+    empty_seq = np.array([], np.int64)
+    source = [sample.get('source', empty_seq) for sample in batch]
+    target = [sample.get('target', empty_seq) for sample in batch]
+    prefix = [sample.get('prefix', empty_seq) for sample in batch]
+    assert len(set(map(len, prefix))) == 1, 'all prefixes should have the same length'
+
     reference = [sample.get('reference') for sample in batch]
     max_source_len = min(max(map(len, source)), max_len)
     max_target_len = min(max(map(len, target)), max_len)
@@ -275,9 +286,7 @@ def collate(batch, max_len, prefix_len=0):
         'target': torch.tensor(np.array(target)),
         'source_len': torch.tensor(np.array(source_len)),
         'target_len': torch.tensor(np.array(target_len)),
+        'prefix': torch.tensor(np.array(prefix)),
         'reference': reference,
     }
-    if prefix_len > 0:
-        batch['prefix'] = batch['target'][:,:prefix_len]
-        assert batch['prefix'].shape[1] == prefix_len
     return batch
