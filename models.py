@@ -5,11 +5,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import math
+import functools
+import time
 from collections import namedtuple
-
+from contextlib import contextmanager
 import sacrebleu
 
 from data import PAD_IDX, SOS_IDX, EOS_IDX
+
+
+def checkpoint(module):
+    module._orig_forward = module.forward
+    from torch.utils.checkpoint import checkpoint
+    module.forward = functools.partial(checkpoint, module._orig_forward, use_reentrant=False)
+    return module
+
+
+@contextmanager
+def benchmark():
+    torch.cuda.empty_cache()
+    mem = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()    
+    start = time.time()
+    yield
+    elapsed = time.time() - start
+    mem = torch.cuda.max_memory_allocated() - mem
+    print(f'Time elapsed: {elapsed:.1f} sec, GPU memory usage: {mem / 2**20:.1f}MiB')
 
 
 class Encoder(nn.Module):
@@ -24,6 +45,9 @@ class Encoder(nn.Module):
         nn.init.normal_(self.embed_tokens.weight, mean=0, std=self.embed_tokens.weight.size(-1) ** -0.5)
         nn.init.constant_(self.embed_tokens.weight[PAD_IDX], 0)
         self.dropout = nn.Dropout(p=self.dropout_rate)
+
+    def select_adapter(self, id):
+        pass
 
 
 class Decoder(nn.Module):
@@ -41,6 +65,9 @@ class Decoder(nn.Module):
         else:
             self.embed_tokens = embed_tokens
         self.dropout = nn.Dropout(p=self.dropout_rate)
+
+    def select_adapter(self, id):
+        pass
 
 
 class MultiheadAttention(nn.Module):
@@ -150,7 +177,7 @@ class BOW_Encoder(Encoder):
         else:
             x = x.sum(dim=1)
 
-        return x.unsqueeze(1), {}
+        return x.unsqueeze(1)
 
 
 class RNN_Encoder(Encoder):
@@ -171,7 +198,7 @@ class RNN_Encoder(Encoder):
         x, _ = self.gru(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
         x = self.dropout(x)
-        return x, {}
+        return x
 
 
 class RNN_Decoder(Decoder):
@@ -209,100 +236,19 @@ class RNN_Decoder(Decoder):
             self.state = hidden
         # output: BxTxH
         x = self.out(output)
-        return {'decoder_output': x}
-
-
-class AttentionModule(nn.Module):
-    def __init__(self, embed_dim, output_size):
-        super().__init__()
-        self.l1 = nn.Linear(embed_dim, output_size, bias=False)
-        self.l2 = nn.Linear(embed_dim + output_size, output_size, bias=False)
-
-    def forward(self, hidden, encoder_outs, src_lens):
-        """
-        hidden: bsz x embed_dim
-        encoder_outs: bsz x sq_len x output_size
-        src_lens: bsz
-
-        x: bsz x output_size
-        attn_score: bsz x sq_len
-        """
-        x = self.l1(hidden)
-        att_score = torch.bmm(encoder_outs, x.unsqueeze(-1))  # bsz x seq x 1
-        att_score = att_score.squeeze(-1)       # bsz x seq
-        att_score = att_score.transpose(0, 1)
-
-        seq_mask = torch.arange(encoder_outs.size(1))[None, :].to(src_lens.device) < src_lens[:, None]
-        seq_mask = seq_mask.transpose(0, 1)
-
-        masked_att = seq_mask * att_score
-        masked_att[masked_att == 0] = -1e10
-        attn_scores = F.softmax(masked_att, dim=0)
-        x = (
-            attn_scores.unsqueeze(2) *
-            encoder_outs.transpose(0, 1)
-        ).sum(dim=0)
-        x = torch.tanh(self.l2(torch.cat((x, hidden), dim=1)))
-        return x, attn_scores
-
-
-class AttentionDecoder(Decoder):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.gru = nn.GRU(
-            self.embed_dim * 2, self.embed_dim, num_layers=self.num_layers,
-            dropout=self.dropout_rate if self.num_layers > 1 else 0
-        )
-        self.out = nn.Linear(self.embed_dim, self.output_size)
-        self.attention = AttentionModule(self.embed_dim, self.embed_dim)
-        self.reset_state()
-    
-    def reset_state(self):
-        self.state = {}
-
-    def forward(self, input, input_len, encoder_output, incremental=False, **kwargs):
-        bsz = input.size(0)
-        tgt_len = input.size(1)
-        
-        hidden = self.state.get('hidden')
-        context = self.state.get('context')
-        if context is None:
-            context = torch.zeros([bsz, self.embed_dim]).to(input.device)
-
-        embed = self.embed_tokens(input)
-        embed = self.dropout(embed)
-        embed = embed.transpose(0, 1)
-        decoder_output = torch.empty(tgt_len, bsz, self.output_size).to(input.device)
-
-        attn_weights = []
-
-        for t in range(tgt_len):
-            x = embed[t]
-            x = torch.cat([x, context], dim=1)
-            x, hidden = self.gru(x.unsqueeze(0), hidden)
-            x = x.squeeze(0)
-            context, attn_weights_ = self.attention(x, encoder_output, input_len)
-            out = self.out(context)
-            decoder_output[t] = out
-            attn_weights.append(attn_weights_.transpose(0, 1))
-
-        if incremental:
-            self.state = {'hidden': hidden, 'context': context}
-
-        decoder_results = {
-            'decoder_output': decoder_output.transpose(0, 1).contiguous(),
-            'attention_weights': torch.stack(attn_weights, axis=1),
-        }
-        return decoder_results
+        return x, None
 
 
 class TransformerEncoder(Encoder):
-    def __init__(self, *args, heads=4, ffn_dim=None, **kwargs):
+    def __init__(self, *args, heads=4, ffn_dim=None, checkpointing=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.heads = heads
         self.ffn_dim = ffn_dim or self.embed_dim
         self.embed_positions = PositionalEncoding(self.embed_dim)
         self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
+        if checkpointing:
+            for layer in self.layers:
+                checkpoint(layer)
         self.layer_norm = nn.LayerNorm(self.embed_dim)
         self.embed_scale = math.sqrt(self.embed_dim)
         self.dropout = nn.Dropout(self.dropout_rate)
@@ -320,27 +266,23 @@ class TransformerEncoder(Encoder):
         x += self.embed_positions(x)
         x = self.dropout(x)
 
-        self_attn_weights = []
         for layer in self.layers:
-            x, self_attn_weights_ = layer(
-                x,
-                src_key_padding_mask=mask
-            )
-            self_attn_weights.append(self_attn_weights_)
+            x = layer(x, src_key_padding_mask=mask)
 
         x = self.layer_norm(x)
-
-        meta = {'self_attention_weights': self_attn_weights}
-        return x.transpose(0, 1), meta
+        return x.transpose(0, 1)
 
 
 class TransformerDecoder(Decoder):
-    def __init__(self, *args, heads=4, ffn_dim=None, **kwargs):
+    def __init__(self, *args, heads=4, ffn_dim=None, checkpointing=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.heads = heads
         self.ffn_dim = ffn_dim or self.embed_dim
         self.embed_positions = PositionalEncoding(self.embed_dim)
         self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
+        if checkpointing:
+            for layer in self.layers:
+                checkpoint(layer)
         self.layer_norm = nn.LayerNorm(self.embed_dim)
         self.embed_scale = math.sqrt(self.embed_dim)
         self.dropout = nn.Dropout(self.dropout_rate)
@@ -377,10 +319,8 @@ class TransformerDecoder(Decoder):
         x += self.embed_positions(x, incremental=incremental)
         x = self.dropout(x)
 
-        self_attn_weights = []
-
         for layer in self.layers:
-            x, self_attn_weights_, attn_weights = layer(
+            x, attn_weights = layer(
                 x,
                 encoder_output,
                 padding_mask=padding_mask,
@@ -389,25 +329,17 @@ class TransformerDecoder(Decoder):
                 incremental=incremental,
             )
             if self.training:
-                attn_weights = self_attn_weights_ = None
-
-            self_attn_weights.append(self_attn_weights_)
+                attn_weights = None
 
         x = self.layer_norm(x)
         x = x.transpose(0, 1)
         out = torch.matmul(x, self.embed_tokens.weight.T)
-
-        decoder_results = {
-            'decoder_output': out,
-            'attention_weights': attn_weights,
-            'self_attention_weights': self_attn_weights
-        }
-        return decoder_results
+        return out, attn_weights
 
 
 class EncoderDecoder(nn.Module):
     def __init__(self, encoder, decoder, lr=1e-3, label_smoothing=0, use_cuda=True, max_len=50, clip=1.0,
-                 scheduler=None, scheduler_args=None):
+                 scheduler=None, scheduler_args=None, amp=True):
         super().__init__()
         self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
         self.encoder = encoder.to(self.device)
@@ -415,6 +347,7 @@ class EncoderDecoder(nn.Module):
         self.lr = lr
         self.max_len = max_len
         self.clip = clip
+        self.amp = amp
         scheduler_args = scheduler_args or {}
         self.criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=PAD_IDX, label_smoothing=label_smoothing)
 
@@ -434,7 +367,8 @@ class EncoderDecoder(nn.Module):
             self.scheduler_fn = scheduler
             self.scheduler_args = scheduler_args
         
-        self.optimizer = self.scheduler = None
+        self.optimizer = self.scheduler = self.scaler = None
+        self.step_skipped = False
         self.epoch = 1
 
         self.START = torch.LongTensor([SOS_IDX]).to(self.device)
@@ -451,6 +385,8 @@ class EncoderDecoder(nn.Module):
     def reset_optimizer(self):
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         self.scheduler = self.scheduler_fn(self.optimizer, **self.scheduler_args)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.step_skipped = False
         self.epoch = 1
 
     def vec2txt(self, vector):
@@ -508,47 +444,44 @@ class EncoderDecoder(nn.Module):
         start = self.START.expand(bsz, 1)
         loss = 0
         if train:
-            self.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             self.encoder.train()
             self.decoder.train()
         else:
             self.encoder.eval()
             self.decoder.eval()
 
-        encoder_output, _ = self.encoder(input, input_len=input_len)
+        with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=(self.amp and train)):
+            encoder_output = self.encoder(input, input_len=input_len)
 
         # Teacher forcing: Feed the target as the next input
         shifted_target = target.narrow(1, 0, target.size(1) - 1)
         decoder_input = torch.cat([start, shifted_target], 1)
 
-        decoder_results = self.decoder(
-            input=decoder_input,
-            input_len=input_len,
-            encoder_output=encoder_output,
-        )
-        decoder_output = decoder_results['decoder_output']
+        with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=(self.amp and train)):
+            decoder_output, _ = self.decoder(
+                input=decoder_input,
+                input_len=input_len,
+                encoder_output=encoder_output,
+            )
         scores = decoder_output.view(-1, decoder_output.size(-1))
         loss = self.criterion(scores, target.view(-1)) / target_len.sum()
         
         if train:
-            loss.backward()
-            self.update_params()
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            if self.clip is not None:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip)
+            self.scaler.step(self.optimizer)
+            scale = self.scaler.get_scale()
+            self.scaler.update()
+            self.step_skipped = self.scaler.get_scale() != scale
 
         return loss.item()
 
     @torch.no_grad()
     def eval_step(self, batch):
         return self.train_step(batch, train=False)
-
-    def zero_grad(self):
-        """Zero out optimizer."""
-        self.optimizer.zero_grad()
-
-    def update_params(self):
-        """Do one optimization step."""
-        if self.clip is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.clip)
-        self.optimizer.step()
 
     def scheduler_step(self, score=None, end_of_epoch=True):
         if end_of_epoch:
@@ -557,10 +490,12 @@ class EncoderDecoder(nn.Module):
             if isinstance(self.scheduler, ReduceLROnPlateau):
                 self.scheduler.step(score)
             elif not isinstance(self.scheduler, WarmupLR):
-                self.scheduler.step()
+                if not self.step_skipped:
+                    self.scheduler.step()
         
         elif isinstance(self.scheduler, WarmupLR):
-            self.scheduler.step()
+            if not self.step_skipped:
+                self.scheduler.step()
 
     @torch.no_grad()
     def decoding_step(self, batch):
@@ -584,9 +519,8 @@ class EncoderDecoder(nn.Module):
 
         self.encoder.eval()
         self.decoder.eval()
-        encoder_output, meta = self.encoder(input, input_len=input_len)
-
-        encoder_self_attn = meta.get('self_attention_weights')
+        # not doing autocast here: for some reason here AMP is slower than full precision here
+        encoder_output = self.encoder(input, input_len=input_len)
 
         predictions = []
         done = [False for _ in range(bsz)]
@@ -596,15 +530,12 @@ class EncoderDecoder(nn.Module):
 
         for _ in range(self.max_len):
             # generate at most max_len tokens
-            decoder_results = self.decoder(
+            decoder_output, attn_weights_ = self.decoder(
                 input=decoder_input,
                 input_len=input_len,
                 encoder_output=encoder_output,
                 incremental=True,
             )
-
-            decoder_output = decoder_results['decoder_output']
-            attn_weights_ = decoder_results.get('attention_weights')
 
             _, preds = decoder_output.max(dim=2)
             preds = preds[:,-1:]
@@ -629,8 +560,8 @@ class EncoderDecoder(nn.Module):
         
         predictions = torch.cat(predictions, 1)
         
-        attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1)
-        return self.vec2txt(predictions), attn, encoder_self_attn
+        attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1).detach().cpu().numpy()
+        return self.vec2txt(predictions), attn   # , encoder_self_attn
 
     def load(self, path, strict=True, reset_optimizer=False):
         if os.path.isfile(path):
@@ -658,6 +589,8 @@ class EncoderDecoder(nn.Module):
                     self.scheduler.load_state_dict(state_dict)
                 if ckpt.get('optimizer'):
                     self.optimizer.load_state_dict(ckpt['optimizer'])
+                if ckpt.get('scaler'):
+                    self.scaler.load_state_dict(ckpt['scaler'])
                 if ckpt.get('metrics'):
                     self.metrics = ckpt['metrics']
                 if ckpt.get('epoch'):
@@ -673,11 +606,26 @@ class EncoderDecoder(nn.Module):
             'scheduler': self.scheduler.state_dict(),
             'metrics': self.metrics,
             'epoch': self.epoch,
+            'scaler': self.scaler.state_dict(),
         }
         torch.save(ckpt, path)
 
     def record(self, name, value):
         self.metrics.setdefault(self.epoch, {})[name] = value
+
+    @contextmanager
+    def adapter(self, id, projection_dim=64, overwrite=False):
+        """
+        Temporarily activates adapters, for example:
+        
+        with model.adapter('en-fr'):
+            translate(model, 'Hello, world')
+        """
+        self.encoder.add_adapter(id, projection_dim, select=True, overwrite=overwrite)
+        self.decoder.add_adapter(id, projection_dim, select=True, overwrite=overwrite)
+        yield
+        self.encoder.select_adapter(None)
+        self.decoder.select_adapter(None)
 
 
 class TransformerEncoderLayer(nn.Module):
@@ -696,7 +644,7 @@ class TransformerEncoderLayer(nn.Module):
         x = src
         residual = x
         x = self.self_attn_layer_norm(x)
-        x, _, self_attn_weights_all_heads = self.self_attn(
+        x, _, _ = self.self_attn(
             x, x, x, attn_mask=src_mask,
             key_padding_mask=src_key_padding_mask)
         x = residual + self.dropout(x)
@@ -704,7 +652,7 @@ class TransformerEncoderLayer(nn.Module):
         x = self.final_layer_norm(x)
         x = self.fc2(self.dropout(self.activation(self.fc1(x))))
         x = residual + self.dropout(x)
-        return x, self_attn_weights_all_heads
+        return x
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -726,14 +674,14 @@ class TransformerDecoderLayer(nn.Module):
         x = tgt
         residual = x
         x = self.self_attn_layer_norm(x)
-        x, _, self_attn_weights_all_heads = self.self_attn(
+        x, _, _ = self.self_attn(
             x, x, x, attn_mask=future_mask,
             key_padding_mask=padding_mask, incremental=incremental)
         x = residual + self.dropout(x)
 
         residual = x
         x = self.encoder_attn_layer_norm(x)
-        x, attn_weights, attn_weights_all_heads = self.encoder_attn(
+        x, attn_weights, _ = self.encoder_attn(
             x, memory, memory, attn_mask=memory_mask,
             key_padding_mask=encoder_mask)
         x = residual + self.dropout(x)
@@ -743,7 +691,7 @@ class TransformerDecoderLayer(nn.Module):
         x = self.fc2(self.dropout(self.activation(self.fc1(x))))
         x = residual + self.dropout(x)
 
-        return x, self_attn_weights_all_heads, attn_weights
+        return x, attn_weights
 
 
 class PositionalEncoding(nn.Module):
@@ -790,81 +738,83 @@ class AdapterLayer(nn.Module):
 
 
 class AdapterTransformerEncoderLayer(TransformerEncoderLayer):
-    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.adapters = nn.ModuleDict({
-            id: AdapterLayer(self.embed_dim, projection_dim)
-            for id in adapter_ids
-        })
+        self.adapters = nn.ModuleDict({})
         self.adapter_id = None
-    
+
+    def add_adapter(self, id, projection_dim, overwrite=False):
+        if overwrite or id not in self.adapters:
+            device = next(iter(self.parameters())).device
+            adapter = AdapterLayer(self.embed_dim, projection_dim).to(device)
+            self.adapters[id] = adapter
+
     def forward(self, *args, **kwargs):
-        x, *out = super().forward(*args, **kwargs)
+        x = super().forward(*args, **kwargs)
         if self.adapter_id is not None:
             x = self.adapters[self.adapter_id](x)
-        return (x, *out)
+        return x
 
 
 class AdapterTransformerEncoder(TransformerEncoder):
-    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
-        self.adapter_ids = adapter_ids
-        self.projection_dim = projection_dim
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        for name, param in self.named_parameters():
-            if '.adapters.' not in name:
-                param.requires_grad = False
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def add_adapter(self, id, projection_dim, select=False, overwrite=False):
+        for layer in self.layers:
+            layer.add_adapter(id, projection_dim, overwrite=overwrite)
+        if select:
+            self.select_adapter(id)
 
     def select_adapter(self, id):
         for layer in self.layers:
+            assert id is None or id in layer.adapters
             layer.adapter_id = id
 
     def build_layer(self, layer_id):
-        return AdapterTransformerEncoderLayer(
-            self.adapter_ids,
-            self.projection_dim,
-            self.embed_dim,
-            self.heads,
-            self.dropout_rate,
-        )
+        return AdapterTransformerEncoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
 
 
 class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
-    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.adapters = nn.ModuleDict({
-            id: AdapterLayer(self.embed_dim, projection_dim)
-            for id in adapter_ids
-        })
+        self.adapters = nn.ModuleDict({})
         self.adapter_id = None
     
+    def add_adapter(self, id, projection_dim, overwrite=False):
+        if overwrite or id not in self.adapters:
+            device = next(iter(self.parameters())).device
+            adapter = AdapterLayer(self.embed_dim, projection_dim).to(device)
+            self.adapters[id] = adapter
+
     def forward(self, *args, **kwargs):
-        x, *out = super().forward(*args, **kwargs)
+        x, attn = super().forward(*args, **kwargs)
         if self.adapter_id is not None:
             x = self.adapters[self.adapter_id](x)
-        return (x, *out)
+        return x, attn
 
 
 class AdapterTransformerDecoder(TransformerDecoder):
-    def __init__(self, adapter_ids, projection_dim, *args, **kwargs):
-        self.adapter_ids = adapter_ids
-        self.projection_dim = projection_dim
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        for name, param in self.named_parameters():
-            if '.adapters.' not in name:
-                param.requires_grad = False
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def add_adapter(self, id, projection_dim, select=False, overwrite=False):
+        for layer in self.layers:
+            layer.add_adapter(id, projection_dim, overwrite=overwrite)
+        if select:
+            self.select_adapter(id)
 
     def select_adapter(self, id):
         for layer in self.layers:
+            assert id is None or id in layer.adapters
             layer.adapter_id = id
 
     def build_layer(self, layer_id):
-        return AdapterTransformerDecoderLayer(
-            self.adapter_ids,
-            self.projection_dim,
-            self.embed_dim,
-            self.heads,
-            self.dropout_rate,
-        )
+        return AdapterTransformerDecoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
 
 
 class WarmupLR(torch.optim.lr_scheduler._LRScheduler):

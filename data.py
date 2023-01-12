@@ -1,8 +1,7 @@
 import numpy as np
 import pandas as pd
 import os
-
-
+import functools
 import torch
 
 SPECIAL_SYMBOLS = SOS_TOKEN, PAD_TOKEN, EOS_TOKEN, UNK_TOKEN = '<sos>', '<pad>', '<eos>', '<unk>'
@@ -16,15 +15,18 @@ class Tokenizer:
         import sentencepiece as spm
         self.model = spm.SentencePieceProcessor()
         self.model.Load(model_path)
-        pass
+    @functools.lru_cache(maxsize=10**4)  # to speed up tokenization of already seen words
+    def _tokenize(self, word):
+        return ' '.join(self.model.encode_as_pieces(word))
+    @functools.lru_cache(maxsize=10**6)  # to speed up tokenization of already seen sentences
     def tokenize(self, line):
-        return ' '.join(self.model.encode_as_pieces(line))
+        return ' '.join(self._tokenize(word) for word in line.split())
     def detokenize(self, line):
         return line.replace(' ', '').replace('▁', ' ').strip()
 
 
 class Dictionary:
-    def __init__(self, minimum_count=10):
+    def __init__(self, minimum_count=10): # FIXME: why not 0 by default? 
         self.words = []     # maps indices to words
         self.indices = {}   # maps words to indices
         self.counts = {}    # maps words to counts
@@ -67,9 +69,12 @@ class Dictionary:
                 tokens.append(self.words[index])
         return ' '.join(tokens)
 
-    def txt2vec(self, sentence):
+    def txt2vec(self, sentence, add_eos=False):
+        sentence = sentence or ''  # to work with None
         indices = [self.index(token) for token in sentence.split()]
-        return torch.from_numpy(np.array(indices))
+        if add_eos:
+            indices.append(EOS_IDX)
+        return np.array(indices, dtype=np.int32)
 
     def save(self, path):
         dirname = os.path.dirname(path)
@@ -214,10 +219,7 @@ class BatchIterator:
         if batch:
             batches.append(batch)
 
-        self.batches = [
-            collate(batch, max_len, source_lang, target_lang, prefix_len=prefix_len)
-            for batch in batches
-        ]
+        self.batches = [collate(batch, max_len, prefix_len=prefix_len) for batch in batches]
         self.shuffle = shuffle
 
     def __len__(self):
@@ -227,11 +229,7 @@ class BatchIterator:
         if self.shuffle:
             np.random.shuffle(self.batches)
 
-        for batch in self.batches:
-            yield {
-                k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
-                for k, v in batch.items()
-            }
+        yield from self.batches
 
 
 class MultilingualBatchIterator(BatchIterator):
@@ -245,12 +243,12 @@ class MultilingualBatchIterator(BatchIterator):
         self.target_lang = 'tgt'
 
 
-def collate(batch, max_len, source_lang, target_lang, prefix_len=0):
+def collate(batch, max_len, prefix_len=0):
     # This function takes a batch containing samples of varying lengths and concatenates these samples 
     # into same length sequences by padding them to the maximum length
     source = [sample['source'] for sample in batch]
     target = [sample['target'] for sample in batch]
-    reference = [sample['reference'] for sample in batch]
+    reference = [sample.get('reference') for sample in batch]
     max_source_len = min(max(map(len, source)), max_len)
     max_target_len = min(max(map(len, target)), max_len)
 
@@ -273,12 +271,10 @@ def collate(batch, max_len, source_lang, target_lang, prefix_len=0):
     target, target_len = zip(*[pad(x, max_target_len) for x in target])
     
     batch = {
-        'source': np.array(source),
-        'target': np.array(target),
-        'source_len': np.array(source_len),
-        'target_len': np.array(target_len),
-        'source_lang': source_lang,
-        'target_lang': target_lang,
+        'source': torch.tensor(np.array(source)),
+        'target': torch.tensor(np.array(target)),
+        'source_len': torch.tensor(np.array(source_len)),
+        'target_len': torch.tensor(np.array(target_len)),
         'reference': reference,
     }
     if prefix_len > 0:

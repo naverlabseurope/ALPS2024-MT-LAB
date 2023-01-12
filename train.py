@@ -40,7 +40,7 @@ parser.add_argument('-v', '--verbose', action='store_true', help='Show training 
 parser.add_argument('--shared-embeddings', action='store_true',
                     help='Use the same joint dictionary on the source and target side, '
                     ' and share the encoder and decoder embedding matrices')
-parser.add_argument('--model-type', choices=['bow', 'rnn', 'rnn_attn', 'transformer'], default='transformer',
+parser.add_argument('--model-type', choices=['bow', 'rnn', 'transformer'], default='transformer',
                     help='which model architecture to use')
 parser.add_argument('--warmup', type=int, help='Use an inverse square root warmup schedule with this number of warmup '
                     'steps. Default: Reduce LR on plateau')
@@ -184,7 +184,7 @@ def evaluate_model(model, test_or_valid_iterators, record=False):
         loss = 0
         for batch in iterator:
             loss += model.eval_step(batch) / len(iterator)
-        translation_output = model.translate(iterator, postprocess)
+        translation_output = model.translate(iterator, postprocess)   # FIXME
         score = translation_output.score
         output = translation_output.output
         
@@ -217,7 +217,7 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
 
     reset_seed()
 
-    if model.epoch >= epochs:
+    if model.epoch > epochs:
         evaluate_model(model, valid_iterators, record=False)
         return
     
@@ -292,9 +292,6 @@ if args.model_type == 'bow':
 elif args.model_type == 'rnn':
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
-elif args.model_type == 'rnn_attn':
-    encoder = models.RNN_Encoder(**encoder_args)
-    decoder = models.AttentionDecoder(**decoder_args)
 else:
     encoder = models.TransformerEncoder(**encoder_args, heads=args.heads)
     decoder = models.TransformerDecoder(**decoder_args, heads=args.heads)
@@ -324,7 +321,7 @@ if not args.reset:
     model.load(args.checkpoint_path)
 
 if model.epoch > 1:
-    print(f'resumed checkpoint {args.checkpoint_path} ({model.epoch} epochs)')
+    print(f'resumed checkpoint {args.checkpoint_path} ({model.epoch - 1} epochs)')
 else:
     print(f'new model checkpoint: {args.checkpoint_path}')
 
