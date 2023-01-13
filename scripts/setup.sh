@@ -15,5 +15,6 @@ pip install sacrebleu
 pip install matplotlib
 pip install requests
 pip install bertviz
+pip install gdown
 
 bash scripts/download-data.sh

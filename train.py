@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import time
 import json
-
+import sacrebleu
 import argparse
 
 parser = argparse.ArgumentParser()
@@ -29,6 +29,7 @@ parser.add_argument('--decoder-layers', type=int, default=1, help='Number of dec
 parser.add_argument('--embed-dim', type=int, default=512, help='Embedding dimension of the model. Default: 512')
 parser.add_argument('--ffn-dim', type=int, help='Feed-forward dimension of the Transformer, if different than --embed-dim')
 parser.add_argument('--max-size', type=int, help='Maximum number of training examples. Default: all')
+parser.add_argument('--max-valid-size', type=int, default=500, help='Maximum number of validation examples. Default: 500')
 parser.add_argument('--max-len', type=int, default=30, help='Maximum number of tokens per line (longer sequences will be truncated). Default: 30')
 parser.add_argument('--data-dir', default='data', metavar='DATA_DIR', help='Directory containing the training data. Default: data')
 parser.add_argument('--dropout', type=float, default=0, help='Dropout rate. Default: 0')
@@ -114,7 +115,7 @@ target_data = []
 for lang_pair in lang_pairs:
     src, tgt = lang_pair
     train_data[lang_pair] = load_data(src, tgt, 'train', max_size=args.max_size)   # set max_size to 10000 for fast debugging
-    valid_data[lang_pair] = load_data(src, tgt, 'valid')
+    valid_data[lang_pair] = load_data(src, tgt, 'valid', max_size=args.max_valid_size)
     source_data += list(train_data[lang_pair]['source_tokenized'])
     target_data += list(train_data[lang_pair]['target_tokenized'])
 
@@ -170,39 +171,43 @@ else:
     train_iterator = train_iterators[0]
 
 
-def evaluate_model(model, test_or_valid_iterators, record=False):
+def evaluate_model(model, *test_or_valid_iterators, record=False):
     """
-    valid_iterators: list of data.BatchIterator
+    Evaluate given models with given test or validation sets. This will compute both chrF and validation loss.
+    
     model: instance of models.EncoderDecoder
+    test_or_valid_iterators: list of BatchIterator
     record: save scores in the model checkpoint
     """
     scores = []
     
-    # Compute chrF over all test or validation sets
+    model.half()  # half-precision decoding is faster on some GPUs (i.e., model parameters and activations
+    # are stored in float16 format instead of float32)
+    
+    # Compute chrF and valid loss over all test or validation sets
     for iterator in test_or_valid_iterators:
-        src, tgt = iterator.source_lang, iterator.target_lang
         loss = 0
+        hypotheses = []
+        references = []
+        
         for batch in iterator:
             loss += model.eval_step(batch) / len(iterator)
-        translation_output = model.translate(iterator, postprocess)   # FIXME
-        score = translation_output.score
-        output = translation_output.output
+            hyps, _ = model.translate(batch)
+            hypotheses += [postprocess(hyp) for hyp in hyps]  # detokenize
+            references += batch['reference']
         
-        print(f'{src}-{tgt}: loss={loss:.3f}, chrF={score:.2f}')
-        print(f"example translation: {output[0]}")
-        print(f"example reference:   {next(iter(iterator))['reference'][0]}")
+        chrf = sacrebleu.corpus_chrf(hypotheses, [references]).score
 
-        if record:
+        src, tgt = iterator.source_lang, iterator.target_lang
+        print(f'{src}-{tgt}: loss={loss:.2f}, chrF={chrf:.2f}')
+        if record:  # store the metrics in the model checkpoint
             model.record(f'{src}_{tgt}_loss', loss)
-            model.record(f'{src}_{tgt}_chrf', score)
-
-        scores.append(score)
+            model.record(f'{src}_{tgt}_chrf', chrf)
+        
+        scores.append(chrf)
 
     # Average the validation chrF scores
     score = sum(scores) / len(scores)
-    if len(scores) > 1:
-        print(f'chrF={score:.2f}')
-
     return score
 
 
@@ -218,13 +223,14 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
     reset_seed()
 
     if model.epoch > epochs:
-        evaluate_model(model, valid_iterators, record=False)
+        evaluate_model(model, *valid_iterators, record=False)
         return
     
     start = time.time()
 
     best_score = -1
     while model.epoch <= epochs:
+        model.float()
 
         start_ = time.time()
         running_loss = 0
@@ -237,7 +243,7 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
             model.scheduler_step(end_of_epoch=False)
             if args.verbose:
                 sys.stderr.write(
-                    "\r{}/{}, wall={:.2f}, loss={:.3f}, lr={:.4e}".format(
+                    "\r{}/{}, wall={:.2f}, train_loss={:.3f}, lr={:.4e}".format(
                         i,
                         len(train_iterator),
                         time.time() - start_,
@@ -252,10 +258,10 @@ def train_model(model, train_iterator, valid_iterators, checkpoint_path, epochs=
         # Average training loss for this epoch
         epoch_loss = running_loss / len(train_iterator)
 
-        print(f"loss={epoch_loss:.3f}, time={time.time() - start_:.2f}")
+        print(f"train_loss={epoch_loss:.3f}, time={time.time() - start_:.2f}")
         model.record('train_loss', epoch_loss)
 
-        score = evaluate_model(model, valid_iterators, record=True)
+        score = evaluate_model(model, *valid_iterators, record=True)
 
         # Update the model's learning rate based on current performance.
         # This scheduler divides the learning rate by 10 if chrF does not improve.

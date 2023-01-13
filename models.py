@@ -6,10 +6,7 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import math
 import functools
-import time
-from collections import namedtuple
 from contextlib import contextmanager
-import sacrebleu
 
 from data import PAD_IDX, SOS_IDX, EOS_IDX
 
@@ -19,27 +16,6 @@ def checkpoint(module):
     from torch.utils.checkpoint import checkpoint
     module.forward = functools.partial(checkpoint, module._orig_forward, use_reentrant=False)
     return module
-
-
-@contextmanager
-def benchmark():
-    torch.cuda.empty_cache()
-    mem = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()    
-    start = time.time()
-    yield
-    elapsed = time.time() - start
-    mem = torch.cuda.max_memory_allocated() - mem
-    print(f'Time elapsed: {elapsed:.1f} sec, GPU memory usage: {mem / 2**20:.1f}MiB')
-
-
-def free_gpu_memory():
-    """ Move all models to the CPU to free GPU memory """
-    global_variables = globals()
-    for k, v in global_variables.items():
-        if isinstance(v, EncoderDecoder):
-            v.cpu()
-    torch.cuda.empty_cache()
 
 
 class Encoder(nn.Module):
@@ -420,21 +396,6 @@ class EncoderDecoder(nn.Module):
             "Improper input to vec2txt with dimensions {}".format(vector.size())
         )
 
-    def translate(self, batch_iterator, detokenize=None):
-        hypotheses = []
-        references = []
-
-        for data in batch_iterator:
-            hyps = self.decoding_step(data)[0]
-            if detokenize is not None:
-                hyps = [detokenize(hyp) for hyp in hyps]
-            hypotheses += hyps
-            references += data['reference']
-
-        chrf = sacrebleu.corpus_chrf(hypotheses, [references])
-        translation_output = namedtuple('translation_output', ['score', 'output'])
-        return translation_output(round(chrf.score, 2), hypotheses)
-
     def train_step(self, batch, train=True):
         input, input_len, target, target_len = batch['source'], batch['source_len'], batch['target'], batch['target_len']
 
@@ -507,7 +468,7 @@ class EncoderDecoder(nn.Module):
                 self.scheduler.step()
 
     @torch.no_grad()
-    def decoding_step(self, batch):
+    def translate(self, batch):
         input, input_len = batch['source'], batch['source_len']
 
         if input is None:
@@ -570,7 +531,7 @@ class EncoderDecoder(nn.Module):
         predictions = torch.cat(predictions, 1)
         
         attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1).detach().cpu().numpy()
-        return self.vec2txt(predictions), attn   # , encoder_self_attn
+        return self.vec2txt(predictions), attn
 
     def load(self, path, strict=True, reset_optimizer=False):
         if not os.path.isfile(path):

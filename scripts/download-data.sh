@@ -22,8 +22,10 @@ fi
 #     python3 scripts/prepare.py it --data-dir data
 # fi
 
-# Download pre-trained models from Dropbox
+# Download pre-trained models from Google Drive
 if [ ! -f pretrained_models/en-fr/transformer.pt ]; then
-    wget -nc https://www.dropbox.com/s/ckdxt6h8hj4lygw/pretrained_models.zip
-    unzip pretrained_models.zip
+    gdown --folder 11uOkrkx-X-jE-yxrHg2zWfyp0kSyeYhZ -O pretrained_models/en-fr
+fi
+if [ ! -f pretrained_models/de-en-fr/transformer.pt ]; then
+    gdown --folder 17jKm0G_fp-POf6e8qbq9O9PqX6_uHAXh -O pretrained_models/de-en-fr
 fi
