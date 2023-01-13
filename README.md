@@ -77,8 +77,8 @@ nvidia-smi
 +-------------------------------+----------------------+----------------------+
 # GPU 1 is free
 CUDA_VISIBLE_DEVICES=1 ./train.py models/en-fr/transformer.pt -s en -t fr \
---model-type transformer --encoder-layers 2 --decoder-layers 1 --heads 4 \
---epochs 10 --lr 0.0005 --batch-size 512 --dropout 0 -v
+--model-type transformer --encoder-layers 2 --decoder-layers 1 --heads 4 --embed-dim 512 --ffn-dim 512 \
+--epochs 10 --lr 0.0005 --batch-size 512 --dropout 0.1 -v
 ```
 
 This will reproduce the training of the EN-FR Transformer model we shared.

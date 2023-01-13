@@ -530,7 +530,7 @@ class EncoderDecoder(nn.Module):
         
         predictions = torch.cat(predictions, 1)
         
-        attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1).detach().cpu().numpy()
+        attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1).float().detach().cpu().numpy()
         return self.vec2txt(predictions), attn
 
     def load(self, path, strict=True, reset_optimizer=False):

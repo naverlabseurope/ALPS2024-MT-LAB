@@ -14,7 +14,6 @@ pip install pandas
 pip install sacrebleu
 pip install matplotlib
 pip install requests
-pip install bertviz
-pip install gdown
+pip install --upgrade gdown
 
 bash scripts/download-data.sh
