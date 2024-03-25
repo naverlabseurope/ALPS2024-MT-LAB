@@ -1,12 +1,12 @@
-# ALPS2023-MT-LAB
-Python notebook and models for the [MT Lab @ ALPS 2023](http://lig-alps.imag.fr)
+# ALPS2024-MT-LAB
+Python notebook and models for the [MT Lab @ ALPS 2024](http://lig-alps.imag.fr)
 
 This repository is a modified version of [another tutorial on NMT](https://github.com/nyu-dl/AMMI-2019-NLP-Part2/blob/master/02-day-RLM%26NMT/02.c.NMT/NMT.ipynb) by Kyunghyun Cho et al.
 
 ### Running on Google Colab
 
 1. Go to https://colab.research.google.com
-2. Under the "GitHub" tab, type the URL of this repo (https://github.com/naverlabseurope/ALPS2023-MT-LAB), then click on "NMT.ipynb"
+2. Under the "GitHub" tab, type the URL of this repo (https://github.com/naverlabseurope/ALPS2024-MT-LAB), then click on "NMT.ipynb"
 
 ![image](https://user-images.githubusercontent.com/1795321/213119740-7197f65a-25f7-4c4a-864f-46266a1b3fbd.png)
 ![image](https://user-images.githubusercontent.com/1795321/213120125-383bf9f7-6537-4d0f-9b07-db149edc7fb5.png)
@@ -17,7 +17,7 @@ This repository is a modified version of [another tutorial on NMT](https://githu
 ![image](https://user-images.githubusercontent.com/1795321/213120508-ec8f6b37-4b34-46cf-a262-a92d162e7dca.png)
 
 4. Open [this link](https://drive.google.com/drive/folders/1E07YaKths98YpoBCH2PjdtTPqOXgfdZB?usp=sharing) and connect to your Google Drive account
-5. Then go to "Shared with me" in your Google Drive, right-click the "ALPS2023-NMT" folder and select "Add shortcut to Drive"
+5. Then go to "Shared with me" in your Google Drive, right-click the "ALPS2024-NMT" folder and select "Add shortcut to Drive"
 
 ![drive](https://user-images.githubusercontent.com/1795321/149558193-c7d008e7-09c8-418d-8fcf-2cfb517a52dc.png)
 
@@ -28,8 +28,8 @@ Note: if you don't have a Google account, you can still run the notebook in Cola
 ### Running the notebook on your own computer
 
 ```
-git clone https://github.com/naverlabseurope/ALPS2023-MT-LAB.git
-cd ALPS2023-MT-LAB
+git clone https://github.com/naverlabseurope/ALPS2024-MT-LAB.git
+cd ALPS2024-MT-LAB
 scripts/setup.sh            # creates a Python environment, installs the dependencies and downloads the data and models
 scripts/run-notebook.sh     # starts a jupyter notebook where the lab will take place
 ```
@@ -43,8 +43,8 @@ In the following, replace `HOSTNAME` by the name of your server.
 1. SSH to the server, install the repo and run the notebook
 ```
 ssh HOSTNAME
-git clone https://github.com/naverlabseurope/ALPS2023-MT-LAB.git
-cd ALPS2023-MT-LAB
+git clone https://github.com/naverlabseurope/ALPS2024-MT-LAB.git
+cd ALPS2024-MT-LAB
 scripts/setup.sh
 scripts/run-notebook.sh    # modify this script to change the port if 8888 is already used
 ```

@@ -2,6 +2,8 @@ import torch
 import time
 import statistics
 import matplotlib.pyplot as plt
+import numpy as np
+import os
 from models import EncoderDecoder
 from data import EOS_TOKEN
 from contextlib import contextmanager
@@ -28,7 +30,7 @@ def free_gpu_memory():
     torch.cuda.empty_cache()
 
 
-def plot_attention(input, output, attention_weights):
+def plot_attention(input: str, output: str, attention_weights: np.ndarray):
     """
     Plot an encoder-decoder attention matrix
     """

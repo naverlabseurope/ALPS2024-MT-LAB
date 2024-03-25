@@ -3,81 +3,117 @@ import pandas as pd
 import os
 import functools
 import torch
+from torch import LongTensor
+from typing import Optional, Any, Union, Callable, Iterator
+
 
 SPECIAL_SYMBOLS = SOS_TOKEN, PAD_TOKEN, EOS_TOKEN, UNK_TOKEN = '<sos>', '<pad>', '<eos>', '<unk>'
-SOS_IDX = EOS_IDX = 2    # like in fairseq
+# default special token ids used in fairseq models (e.g., NLLB):
+SOS_IDX = EOS_IDX = 2
 PAD_IDX = 1
 UNK_IDX = 3
 
 
 class Tokenizer:
-    def __init__(self, model_path):
+    def __init__(self, model_path: str):
         import sentencepiece as spm
         self.model = spm.SentencePieceProcessor()
         self.model.Load(model_path)
-    @functools.lru_cache(maxsize=10**4)  # to speed up tokenization of already seen words
-    def _tokenize(self, word):
+    
+    @functools.lru_cache(maxsize=10**4)  # to speed up tokenization of already-seen words
+    def _tokenize(self, word: str) -> str:
         return ' '.join(self.model.encode_as_pieces(word))
-    @functools.lru_cache(maxsize=10**6)  # to speed up tokenization of already seen sentences
-    def tokenize(self, line):
+    
+    @functools.lru_cache(maxsize=10**6)  # to speed up tokenization of already-seen sentences
+    def tokenize(self, line: str) -> str:
         line = line or ''  # to also work with None
         return ' '.join(self._tokenize(word) for word in line.split())
-    def detokenize(self, line):
+    
+    def detokenize(self, line: str) -> str:
         return line.replace(' ', '').replace('▁', ' ').strip()
 
 
 class Dictionary:
-    def __init__(self, minimum_count=10): # FIXME: why not 0 by default? 
+    def __init__(
+        self,
+        minimum_count: int = 10,
+        unk_idx: int = UNK_IDX,
+        sos_idx: int = SOS_IDX,
+        eos_idx: int = EOS_IDX,
+        pad_idx: int = PAD_IDX,
+        shift: int = 4,  # fairseq-style
+    ):
         self.words = []     # maps indices to words
         self.indices = {}   # maps words to indices
         self.counts = {}    # maps words to counts
         self.minimum_count = minimum_count
+        self.unk_idx = unk_idx
+        self.sos_idx = sos_idx
+        self.eos_idx = eos_idx
+        self.pad_idx = pad_idx
+        self.shift = shift
 
-        for token in SPECIAL_SYMBOLS:
-            self.add_symbol(token)
-
-    def add_symbol(self, word, count=None):
+    def add_symbol(self, word: str, count: Optional[int] = None) -> None:
         count = count or self.minimum_count
 
         self.counts[word] = self.counts.get(word, 0) + count
 
         if word not in self.indices and self.counts[word] >= self.minimum_count:
-            index = len(self.words)
+            index = len(self.words) + self.shift
             self.words.append(word)
             self.indices[word] = index
 
-    def __len__(self):
-        return len(self.words)
+    def __len__(self) -> int:
+        return len(self.words) + self.shift
 
-    def index(self, word):
-        return self.indices.get(word, UNK_IDX)
+    def index(self, word: str) -> int:
+        if word == EOS_TOKEN:
+            return self.eos_idx
+        elif word == SOS_TOKEN:
+            return self.sos_idx
+        elif word == UNK_TOKEN:
+            return self.unk_idx
+        elif word == PAD_TOKEN:
+            return self.pad_idx
+        else:
+            return self.indices.get(word, self.unk_idx)
     
-    def __getitem__(self, index):
-        return self.words[index]
+    def __getitem__(self, index: int) -> str:
+        if index == self.eos_idx:
+            return EOS_TOKEN
+        elif index == self.pad_idx:
+            return PAD_TOKEN
+        elif index == self.sos_idx:
+            return SOS_TOKEN
+        elif index == self.unk_idx:
+            return UNK_TOKEN
+        else:
+            return self.words[index - self.shift]
 
-    def __setitem__(self, index, word):
-        old_word = self.words[index]
-        self.words[index] = word
+    def __setitem__(self, index: int, word: str) -> None:
+        assert index not in (self.sos_idx, self.eos_idx, self.pad_idx, self.unk_idx)
+        old_word = self.words[index - self.shift]
+        self.words[index - self.shift] = word
         self.indices.pop(old_word)
         self.indices[word] = index
 
-    def vec2txt(self, indices):
+    def vec2txt(self, indices: Union[list[int], np.ndarray, LongTensor]) -> str:
         tokens = []
         for index in indices:
             if not isinstance(index, int):
                 index = index.item()
-            if index not in (EOS_IDX, SOS_IDX, PAD_IDX):
-                tokens.append(self.words[index])
+            if index not in (self.sos_idx, self.eos_idx, self.pad_idx):  # skip special tokens
+                tokens.append(self[index])
         return ' '.join(tokens)
 
-    def txt2vec(self, sentence, add_eos=False):
+    def txt2vec(self, sentence: str, add_eos: bool = False) -> np.ndarray:
         sentence = sentence or ''  # to work with None
         indices = [self.index(token) for token in sentence.split()]
         if add_eos:
-            indices.append(EOS_IDX)
+            indices.append(self.eos_idx)
         return np.array(indices, dtype=np.int64)
 
-    def save(self, path):
+    def save(self, path: str) -> None:
         dirname = os.path.dirname(path)
         if dirname:
             os.makedirs(dirname, exist_ok=True)
@@ -87,7 +123,7 @@ class Dictionary:
             )
     
     @staticmethod
-    def load(path, minimum_count=0):
+    def load(path: str, minimum_count: int = 0) -> 'Dictionary':
         dictionary = Dictionary(minimum_count)
 
         with open(path, 'r') as f:
@@ -98,7 +134,11 @@ class Dictionary:
         return dictionary
 
 
-def binarize(dataset, source_dict, target_dict, sort=True):
+def binarize(
+    dataset: pd.DataFrame,
+    source_dict: Dictionary,
+    target_dict: Dictionary, sort: bool = True,
+) -> bool:
     for key in 'source', 'target', 'prefix':
         dictionary = source_dict if key == 'source' else target_dict
 
@@ -119,8 +159,10 @@ def binarize(dataset, source_dict, target_dict, sort=True):
     if sort:
         dataset.sort_values(by=['source_len', 'target_len'], inplace=True, kind='mergesort')
 
+    dataset.pad_idx = target_dict.pad_idx  # for collate()
 
-def load_or_create_dictionary(dict_path, dataset, reset=False):
+
+def load_or_create_dictionary(dict_path: str, dataset: pd.DataFrame, reset: bool = False) -> Dictionary:
     if not reset and os.path.isfile(dict_path):
         dictionary = Dictionary.load(dict_path)
     else:
@@ -133,7 +175,13 @@ def load_or_create_dictionary(dict_path, dataset, reset=False):
     return dictionary
 
 
-def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None):
+def load_dataset(
+    path: str,
+    source_lang: Optional[str],
+    target_lang: Optional[str],
+    preprocess: Optional[Callable] = None,
+    max_size: Optional[int] = None,
+) -> pd.DataFrame:
     dataset = pd.DataFrame()
 
     def preprocess_and_split(source_line, target_line):
@@ -186,15 +234,24 @@ def load_dataset(path, source_lang, target_lang, preprocess=None, max_size=None)
     return dataset
 
 
-def concatenate_datasets(datasets):
+def concatenate_datasets(datasets: list[pd.DataFrame]) -> pd.DataFrame:
     return pd.concat(datasets, ignore_index=True)
 
 
 class BatchIterator:
-    def __init__(self, data, source_lang, target_lang, batch_size, max_len, shuffle=True):
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        source_lang: str,
+        target_lang: str,
+        batch_size: int,
+        max_len: int,
+        shuffle: bool = True,
+    ):
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.data = data
+        pad_idx = data.pad_idx
 
         batches = []
         batch = []
@@ -226,13 +283,13 @@ class BatchIterator:
         if batch:
             batches.append(batch)
 
-        self.batches = [collate(batch, max_len) for batch in batches]
+        self.batches = [collate(batch, max_len, pad_idx) for batch in batches]
         self.shuffle = shuffle
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.batches)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[dict[str, Any]]:
         if self.shuffle:
             np.random.shuffle(self.batches)
 
@@ -240,7 +297,7 @@ class BatchIterator:
 
 
 class MultilingualBatchIterator(BatchIterator):
-    def __init__(self, iterators, shuffle=True):
+    def __init__(self, iterators: list[BatchIterator], shuffle: bool = True):
         # Note that this builds homogeneous batches (all examples in a given batch are from the same language pair)
         # Heterogeneous batches might give better results
         self.iterators = iterators
@@ -250,10 +307,11 @@ class MultilingualBatchIterator(BatchIterator):
         self.target_lang = 'tgt'
 
 
-def collate(batch, max_len):
+def collate(batch: dict[str, Any], max_len: int, pad_idx: int) -> dict[str, Any]:
     # This function takes a batch containing samples of varying lengths and concatenates these samples 
     # into same length sequences by padding them to the maximum length
     empty_seq = np.array([], np.int64)
+    # TODO: concatenate source and target here?
     source = [sample.get('source', empty_seq) for sample in batch]
     target = [sample.get('target', empty_seq) for sample in batch]
     prefix = [sample.get('prefix', empty_seq) for sample in batch]
@@ -263,7 +321,7 @@ def collate(batch, max_len):
     max_source_len = min(max(map(len, source)), max_len)
     max_target_len = min(max(map(len, target)), max_len)
 
-    def pad(seq, max_len):
+    def pad(seq: np.ndarray, max_len: int) -> tuple[np.ndarray, int]:
         seq = np.array(seq)
         seq_len = len(seq)
         if seq_len > max_len:
@@ -274,7 +332,7 @@ def collate(batch, max_len):
             seq = np.pad(
                 seq,
                 pad_width=(0, max_len - seq_len),
-                mode="constant", constant_values=PAD_IDX
+                mode="constant", constant_values=pad_idx,
             )
         return seq, seq_len
 

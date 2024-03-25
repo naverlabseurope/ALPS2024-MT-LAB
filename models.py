@@ -3,139 +3,338 @@ import torch
 from torch import optim
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LRScheduler
+from torch import Tensor, BoolTensor, LongTensor
 import math
 import functools
+from typing import Optional, Union, Any
+from data import Dictionary
 from contextlib import contextmanager
 
-from data import PAD_IDX, SOS_IDX, EOS_IDX
 
-
-def checkpoint(module):
+def checkpoint(module: nn.Module):
     module._orig_forward = module.forward
     from torch.utils.checkpoint import checkpoint
     module.forward = functools.partial(checkpoint, module._orig_forward, use_reentrant=False)
     return module
 
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt((x**2).mean(-1, keepdim=True) + self.eps) * self.weight
+        return x.to(dtype)
+
+
 class Encoder(nn.Module):
-    def __init__(self, source_dict, embed_dim=512, num_layers=1, dropout=0, **kwargs):
+    def __init__(
+        self,
+        source_dict: Dictionary,
+        embed_dim: int = 512,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        **kwargs,
+    ):
         super().__init__()
         self.source_dict = source_dict
+        self.pad_idx = source_dict.pad_idx
+        self.eos_idx = source_dict.eos_idx
+        self.sos_idx = source_dict.sos_idx
         self.input_size = len(source_dict)
         self.embed_dim = embed_dim
         self.num_layers = num_layers
         self.dropout_rate = dropout
-        self.embed_tokens = nn.Embedding(self.input_size, self.embed_dim, padding_idx=PAD_IDX)
+        self.embed_tokens = nn.Embedding(self.input_size, self.embed_dim, padding_idx=self.pad_idx)
         nn.init.normal_(self.embed_tokens.weight, mean=0, std=self.embed_tokens.weight.size(-1) ** -0.5)
-        nn.init.constant_(self.embed_tokens.weight[PAD_IDX], 0)
+        nn.init.constant_(self.embed_tokens.weight[self.pad_idx], 0)
         self.dropout = nn.Dropout(p=self.dropout_rate)
 
-    def select_adapter(self, id):
+    def select_adapter(self, id: str) -> None:
         pass
 
 
 class Decoder(nn.Module):
-    def __init__(self, target_dict, embed_dim=512, num_layers=1, dropout=0, embed_tokens=None, **kwargs):
+    def __init__(
+        self,
+        target_dict: Dictionary,
+        embed_dim: int = 512,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        embed_tokens: Optional[nn.Embedding] = None,
+        **kwargs,
+    ):
         super().__init__()
         self.target_dict = target_dict
+        self.pad_idx = target_dict.pad_idx
+        self.eos_idx = target_dict.eos_idx
+        self.sos_idx = target_dict.sos_idx
         self.output_size = len(target_dict)
         self.embed_dim = embed_dim
         self.num_layers = num_layers
         self.dropout_rate = dropout
         if embed_tokens is None:
-            self.embed_tokens = nn.Embedding(self.output_size, self.embed_dim, padding_idx=PAD_IDX)
+            self.embed_tokens = nn.Embedding(self.output_size, self.embed_dim, padding_idx=self.pad_idx)
             nn.init.normal_(self.embed_tokens.weight, mean=0, std=self.embed_tokens.weight.size(-1) ** -0.5)
-            nn.init.constant_(self.embed_tokens.weight[PAD_IDX], 0)
+            nn.init.constant_(self.embed_tokens.weight[self.pad_idx], 0)
         else:
             self.embed_tokens = embed_tokens
         self.dropout = nn.Dropout(p=self.dropout_rate)
 
-    def select_adapter(self, id):
+    def select_adapter(self, id: str) -> None:
         pass
 
 
-class MultiheadAttention(nn.Module):
-    """ Copied from fairseq """
 
-    def __init__(self, embed_dim, num_heads, dropout=0.0):
+class MultiheadAttention(nn.Module):  # copied from Pasero
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, rope: bool = False, causal: bool = False,
+                 has_bias: bool = True, kv_heads: Optional[int] = None):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-        self.dropout = nn.Dropout(dropout)
-        self.head_dim = embed_dim // num_heads
-        assert (self.head_dim * num_heads == embed_dim), 'embed_dim must be divisible by num_heads'
-        self.scaling = self.head_dim ** -0.5
-        self.k_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.v_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.q_proj = nn.Linear(embed_dim, embed_dim, bias=True)
-        self.out_proj = nn.Linear(embed_dim, embed_dim, bias=True)
+        kv_heads = kv_heads or num_heads  # for grouped-query attention
+        self.kv_heads = kv_heads
+        self.dropout = dropout
+
+        self.head_dim = embed_dim // num_heads  # does not work with T5 small
+        self.kv_dim = self.kv_heads * self.head_dim
+        self.q_dim = self.num_heads * self.head_dim
+        assert num_heads % kv_heads == 0
+        self.has_bias = has_bias
+        
+        self.k_proj = nn.Linear(embed_dim, self.kv_dim, bias=self.has_bias)
+        self.v_proj = nn.Linear(embed_dim, self.kv_dim, bias=self.has_bias)
+        self.q_proj = nn.Linear(embed_dim, self.q_dim, bias=self.has_bias)
+        self.out_proj = nn.Linear(self.q_dim, embed_dim, bias=self.has_bias)
+        self.rotary_embed = RotaryEmbedding(self.head_dim) if rope else None
         nn.init.xavier_uniform_(self.k_proj.weight, gain=1 / math.sqrt(2))
         nn.init.xavier_uniform_(self.v_proj.weight, gain=1 / math.sqrt(2))
         nn.init.xavier_uniform_(self.q_proj.weight, gain=1 / math.sqrt(2))
         nn.init.xavier_uniform_(self.out_proj.weight)
-        nn.init.constant_(self.out_proj.bias, 0.0)
+        if self.out_proj.bias is not None:
+            nn.init.constant_(self.out_proj.bias, 0.0)
+        self.causal = causal
+        self.causal_mask = torch.empty(0, dtype=torch.bool)
         self.reset_state()
 
-    def reset_state(self):
-        self.state = None
-
-    def forward(self, query, key, value, key_padding_mask=None, attn_mask=None, incremental=False):
-        tgt_len, batch_size, embed_dim = query.size()
-        q = self.q_proj(query) * self.scaling
-        q = q.contiguous().view(tgt_len, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
-
-        k = self.k_proj(key)
-        k = k.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
-        v = self.v_proj(value)
-        v = v.contiguous().view(-1, batch_size * self.num_heads, self.head_dim).transpose(0, 1)
+    def reset_state(self) -> None:
+        self.state = {}
+    
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        padding_mask: Optional[BoolTensor] = None,
+        return_attn: bool = False,
+        incremental: bool = False,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Shape:
+            query: (B, T, D)
+            key:   (B, S, D)
+            value: (B, S, D)
+            padding_mask: (B, S)
         
-        if incremental and self.state is not None:
-            prev_key = self.state['prev_key']
-            prev_value = self.state['prev_value']
-            prev_key_padding_mask = self.state['prev_key_padding_mask']
-            prev_key = prev_key.view(batch_size * self.num_heads, -1, self.head_dim)
-            prev_value = prev_value.view(batch_size * self.num_heads, -1, self.head_dim)
-            k = torch.cat([prev_key, k], dim=1)
-            v = torch.cat([prev_value, v], dim=1)
-            key_padding_mask = torch.cat([prev_key_padding_mask.float(), key_padding_mask.float()], dim=1)
+        Returns: tuple (attn, attn_weights) with
+            attn: tensor of shape (B, T, D)
+            attn_weights: tensor of shape (B, T, H, S) or None
+        """
+        if padding_mask is not None and self.causal:
+            # attn_mask can be a simple padding mask, in which case it is useless for causal attention (assuming the
+            # padding tokens are always at the end...)
+            padding_mask = None  # set to None to allow the use of fast causal attention below
+        
+        batch_size, tgt_len, embed_dim = query.size()
+        src_len = key.size(1)
+
+        q = self.q_proj(query)  # BxTxD
+        q = q.view(batch_size, tgt_len, self.num_heads, self.head_dim)  # BxTxHxD'
+        k = self.k_proj(key)  # BxSxD
+        k = k.view(batch_size, -1, self.kv_heads, self.head_dim)  # BxSxH'xD'
+        v = self.v_proj(value)
+        v = v.view(batch_size, -1, self.kv_heads, self.head_dim)  # BxSxH'xD'
+
+        pos_offset = self.state['key'].size(1) if self.state and incremental else 0
+        
+        if self.rotary_embed is not None:
+            q, k = self.rotary_embed(q, k, offset=pos_offset)
 
         if incremental:
-            self.state = {
-                'prev_key': k.view(batch_size, self.num_heads, -1, self.head_dim),
-                'prev_value': v.view(batch_size, self.num_heads, -1, self.head_dim),
-                'prev_key_padding_mask': key_padding_mask,
-            }
+            if self.state:  # step > 0
+                prev_key = self.state['key']  # BxSxHxD'
+                prev_value = self.state['value']  # BxSxHxD'
+                k = torch.cat([prev_key, k], dim=1)
+                v = torch.cat([prev_value, v], dim=1)
+                src_len = k.size(1)
 
-        src_len = k.size(1)
-        attn_weights = torch.bmm(q, k.transpose(1, 2))
+            self.state['key'] = k
+            self.state['value'] = v
 
-        if attn_mask is not None:
-            attn_mask = attn_mask.unsqueeze(0)
-            attn_weights.masked_fill_(attn_mask, float("-inf"))
+        r = self.num_heads // self.kv_heads
+        if r > 1:
+            v = v.repeat_interleave(r, dim=2)
+            k = k.repeat_interleave(r, dim=2)
 
-        if key_padding_mask is not None:
-            attn_weights = attn_weights.view(batch_size, self.num_heads, tgt_len, src_len)
-            attn_weights = attn_weights.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2).to(torch.bool),
-                float('-inf'),
-            )
-            attn_weights = attn_weights.view(batch_size * self.num_heads, tgt_len, src_len)
+        if self.head_dim > 64:
+            return_attn = True  # dirty bug fix with flash attention
 
-        attn_weights_float = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32)
-        attn_weights = attn_weights_float.type_as(attn_weights)
-        attn_probs = self.dropout(attn_weights)
+        attn_mask = None
+        if return_attn or padding_mask is not None:  # custom masking
+            if padding_mask is not None:
+                attn_mask = padding_mask[:,None,None,:]  # Bx1x1xS
 
-        attn = torch.bmm(attn_probs, v)
-        attn = attn.transpose(0, 1).contiguous().view(tgt_len, batch_size, embed_dim)
+            if self.causal:
+                if self.causal_mask.size(0) < src_len:
+                    size = 256 * math.ceil(src_len / 256)
+                    self.causal_mask = torch.ones(size, size, dtype=torch.bool, device=q.device)
+                    self.causal_mask = torch.triu(self.causal_mask, 1)
+                    
+                self.causal_mask = self.causal_mask.to(q.device)
+                causal_mask = self.causal_mask[:src_len, :src_len]
+                causal_mask = causal_mask[-tgt_len:]
+                causal_mask = causal_mask.view(1, 1, tgt_len, src_len)  # 1x1xTxS
+                attn_mask = causal_mask if attn_mask is None else (attn_mask + causal_mask)
+            
+            if attn_mask is not None:
+                attn_mask = attn_mask.to(q.dtype).masked_fill(attn_mask, -float('inf'))  # bool -> float
+
+        dropout_p = self.dropout if self.training else 0
+        is_causal = self.causal and tgt_len > 1 and attn_mask is None  # let Pytorch compute the causal mask
+
+        if not return_attn:
+            q = q.transpose(1, 2)  # BxHxTxD'
+            k = k.transpose(1, 2)  # BxHxSxD'
+            v = v.transpose(1, 2)  # BxHxSxD'
+            attn: Tensor = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                dropout_p=dropout_p,
+            )  # BxHxTxD'
+            attn_weights = None
+            attn = attn.transpose(1, 2)
+        else:
+            # use custom attention if we need the attention weights or flash attention is not available (e.g., 
+            # Pytorch version that is too old)
+            q = q.transpose(1, 2)  # BxHxTxD'
+            k = k.transpose(1, 2)  # BxHxSxD'
+            v = v.transpose(1, 2)  # BxHxSxD'
+            attn, attn_weights = self.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                dropout_p=dropout_p,
+            )  # BxHxTxD'
+            attn = attn.transpose(1, 2)
+        
+        attn = attn.reshape(batch_size, tgt_len, -1)  # BxTxD
         attn = self.out_proj(attn)
 
-        attn_weights = attn_weights.view(batch_size, self.num_heads, tgt_len, src_len)
-        return attn, torch.sum(attn_weights, dim=1) / self.num_heads, attn_weights
+        return attn, attn_weights
+
+    @classmethod
+    def scaled_dot_product_attention(
+        cls,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        attn_mask: Tensor,
+        dropout_p: float = 0.0,
+    ) -> tuple[Tensor, Tensor]:
+        # q: BxHxTxD
+        # k: BxHxSxD
+        # v: BxHxSxD
+        # attn_mask: BxHxTxS
+        head_dim = q.shape[-1]
+        scale = 1.0 / head_dim ** 0.5
+
+        attn_weights = torch.matmul(q, k.transpose(2, 3)) * scale  # BxHxTxS
+
+        if attn_mask is not None:
+            attn_weights += attn_mask
+        
+        attn_weights_float = F.softmax(attn_weights, dim=-1, dtype=torch.float)
+        attn_weights_float = attn_weights_float.nan_to_num()  # NaNs can happen with BLOOM models where the beginning
+        # of sentence is replaced by a padding token
+        attn_weights = attn_weights_float.type_as(attn_weights)
+        attn_weights_ = F.dropout(attn_weights, p=dropout_p)  # BxHxTxS
+        attn = torch.matmul(attn_weights_, v)  # BxHxTxD
+        attn_weights = attn_weights.transpose(1, 2)  # BxTxHxS
+        return attn, attn_weights
+
+
+class RotaryEmbedding(nn.Module):  # copied from Pasero
+    def __init__(self, dim, base=10000):
+        super().__init__()
+        self.dim = dim
+        self.inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.build(max_len=256)  # will be automatically extended if needed
+
+    def build(self, max_len: int):
+        t = torch.arange(max_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
+        freqs = torch.einsum('i,j->ij', t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.cos = emb.cos()
+        self.sin = emb.sin()
+        self.max_len = max_len
+
+    def rotate(self, x):
+        x1 = x[..., :self.dim // 2]
+        x2 = x[..., self.dim // 2:]
+        return torch.cat([-x2, x1], dim=-1)
+
+    def forward(self, query: Tensor, key: Tensor, offset: Union[LongTensor, int]) -> tuple[Tensor, Tensor]:
+        """
+        :param query: tensor of shape (B, T, H, D)
+        :param key: tensor of shape (B, S, H, D)
+        :param offset: number of previous tokens (during incremental decoding), can be a tensor of shape (B,) if the
+            length of the each sequence in the batch is different (due to different padding)
+        
+        Returns: rotated query and key
+        """
+        bsz, seq_len, _, dim = query.shape
+
+        total_len = offset.max() if torch.is_tensor(offset) else offset
+        total_len += seq_len
+        if total_len > self.max_len:  # extend the size of the embeddings if needed
+            new_max_len = 2**math.ceil(math.log2(total_len))  # closest power of 2
+            self.build(new_max_len)
+
+        self.cos = self.cos.to(query)  # device and dtype
+        self.sin = self.sin.to(query)
+
+        if torch.is_tensor(offset) and offset.dim() == 1:
+            cos = self.cos.repeat(bsz, 1, 1)  # B x MAX_LEN x D
+            sin = self.sin.repeat(bsz, 1, 1)  # B x MAX_LEN x D
+            positions = torch.arange(seq_len, device=query.device).unsqueeze(0) + offset.unsqueeze(1)  # BxT
+            positions = positions.unsqueeze(-1).repeat(1, 1, cos.size(-1))  # BxTxD
+            cos = torch.gather(cos, dim=1, index=positions)  # BxTxD
+            sin = torch.gather(sin, dim=1, index=positions)  # BxTxD
+            cos = cos.unsqueeze(2)  # BxTx1xD
+            sin = sin.unsqueeze(2)  # BxTx1xD
+        else:
+            cos = self.cos[None, offset : offset + seq_len, None]  # 1xTx1xD
+            sin = self.sin[None, offset : offset + seq_len, None]  # 1xTx1xD
+
+        q = query[..., :self.dim]  # BxTxHxD
+        k = key[..., :self.dim]
+    
+        q = (q * cos) + (self.rotate(q) * sin)
+        k = (k * cos) + (self.rotate(k) * sin)
+
+        if self.dim < dim:
+            q = torch.cat([q, query[..., self.dim:]], dim=-1)
+            k = torch.cat([k, key[..., self.dim:]], dim=-1)
+        return q, k
 
 
 class BOW_Encoder(Encoder):
-    def __init__(self, *args, reduce="max", **kwargs):
+    def __init__(self, *args, reduce: str = "max", **kwargs):
         super().__init__(*args, **kwargs)
         self.reduce = reduce
         assert(self.reduce in ["sum", "mean", "max"])
@@ -144,7 +343,7 @@ class BOW_Encoder(Encoder):
         for _ in range(self.num_layers - 1):
             self.layers.append(nn.Linear(self.embed_dim, self.embed_dim))
 
-    def forward(self, input, input_len, **kwargs):
+    def forward(self, input: LongTensor, input_len: LongTensor, **kwargs):
         x = self.embed_tokens(input)
 
         for layer in self.layers:
@@ -173,7 +372,7 @@ class RNN_Encoder(Encoder):
             dropout=self.dropout_rate if self.num_layers > 1 else 0
         )
 
-    def forward(self, input, input_len, **kwargs):
+    def forward(self, input: LongTensor, input_len: LongTensor, **kwargs):
         """Return encoded state.
         :param input: (batch_size x seqlen) tensor of token indices.
         """
@@ -196,10 +395,17 @@ class RNN_Decoder(Decoder):
         self.out = nn.Linear(self.embed_dim, self.output_size)
         self.reset_state()
 
-    def reset_state(self):
+    def reset_state(self) -> None:
         self.state = None
 
-    def forward(self, input, input_len, encoder_output, incremental=False, **kwargs):
+    def forward(
+        self,
+        input: LongTensor,
+        input_len: LongTensor,
+        encoder_output: Tensor,
+        incremental: bool = False,
+        **kwargs,
+    ) -> tuple[Tensor, None]:
         """Return encoded state.
         :param input: batch_size x tgt_len tensor of token indices.
         """
@@ -225,63 +431,121 @@ class RNN_Decoder(Decoder):
 
 
 class TransformerEncoder(Encoder):
-    def __init__(self, *args, heads=4, ffn_dim=None, checkpointing=False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        num_heads: int = 4,
+        ffn_dim: Optional[int] = None,
+        checkpointing: bool = False,
+        has_bias: bool = True,
+        has_encoder: bool = True,
+        activation: str = 'relu',
+        rms_norm: bool = False,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.heads = heads
+        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
+        self.num_heads = num_heads
         self.ffn_dim = ffn_dim or self.embed_dim
-        self.embed_positions = PositionalEncoding(self.embed_dim)
+        self.embed_positions = PositionalEncoding(self.embed_dim, self.pad_idx)
+        self.has_encoder = has_encoder
+        self.has_bias = has_bias
+        self.activation = activation
+        self.rms_norm = rms_norm
         self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
         if checkpointing:
             for layer in self.layers:
                 checkpoint(layer)
-        self.layer_norm = nn.LayerNorm(self.embed_dim)
+        self.layer_norm = LayerNorm(self.embed_dim)
         self.embed_scale = math.sqrt(self.embed_dim)
         self.dropout = nn.Dropout(self.dropout_rate)
     
-    def build_layer(self, layer_id):
-        return TransformerEncoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
+    def build_layer(self, layer_id: int) -> 'TransformerEncoderLayer':
+        return TransformerEncoderLayer(
+            self.embed_dim,
+            self.num_heads,
+            self.dropout_rate,
+            self.ffn_dim,
+            has_bias=self.has_bias,
+            activation=self.activation,
+            rms_norm=self.rms_norm,
+        )
 
-    def forward(self, input, input_len, **kwargs):
+    def forward(self, input: LongTensor, input_len: int, **kwargs) -> Tensor:
         x = self.embed_tokens(input) * self.embed_scale
 
         mask = torch.arange(input.size(1))[None, :].to(input_len.device) >= input_len[:, None]
         # shape: (batch_size, src_len)
 
-        x = x.transpose(0, 1)   # src_len first
         x += self.embed_positions(x)
         x = self.dropout(x)
 
         for layer in self.layers:
-            x = layer(x, src_key_padding_mask=mask)
+            x = layer(x, padding_mask=mask)
 
-        x = self.layer_norm(x)
-        return x.transpose(0, 1)
+        return self.layer_norm(x)
 
 
 class TransformerDecoder(Decoder):
-    def __init__(self, *args, heads=4, ffn_dim=None, checkpointing=False, **kwargs):
+    def __init__(
+        self, *args,
+        num_heads: int = 4,
+        ffn_dim: Optional[int] = None,
+        checkpointing: bool = False,
+        has_bias: bool = True,
+        has_encoder: bool = True,
+        activation: str = 'relu',
+        rms_norm: bool = False,
+        tied_embed: bool = True,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
-        self.heads = heads
+        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
+        self.num_heads = num_heads
         self.ffn_dim = ffn_dim or self.embed_dim
-        self.embed_positions = PositionalEncoding(self.embed_dim)
+        self.embed_positions = PositionalEncoding(self.embed_dim, self.pad_idx)  # TODO (Llama)
+        self.has_encoder = has_encoder
+        self.has_bias = has_bias
+        self.activation = activation
+        self.rms_norm = rms_norm
         self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
         if checkpointing:
             for layer in self.layers:
                 checkpoint(layer)
-        self.layer_norm = nn.LayerNorm(self.embed_dim)
+        self.layer_norm = LayerNorm(self.embed_dim)
+        self.output_projection = (
+            None if tied_embed else
+            nn.Linear(self.embed_dim, self.embed_tokens.num_embeddings, has_bias=False)
+        )
         self.embed_scale = math.sqrt(self.embed_dim)
         self.dropout = nn.Dropout(self.dropout_rate)
-        self.future_mask = torch.empty(0, dtype=torch.bool)
 
-    def build_layer(self, layer_id):
-        return TransformerDecoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
+    def build_layer(self, layer_id: int) -> 'TransformerDecoderLayer':
+        return TransformerDecoderLayer(
+            self.embed_dim,
+            self.num_heads,
+            self.dropout_rate,
+            self.ffn_dim,
+            has_bias=self.has_bias,
+            has_encoder=self.has_encoder,
+            activation=self.activation,
+            rms_norm=self.rms_norm,
+        )
 
-    def reset_state(self):
+    def reset_state(self) -> None:
         self.embed_positions.reset_state()
         for layer in self.layers:
             layer.self_attn.reset_state()
 
-    def forward(self, input, input_len, encoder_output, incremental=False, **kwargs):
+    def forward(
+        self,
+        input: LongTensor,
+        input_len: LongTensor,
+        encoder_output: Tensor,
+        incremental: bool = False,
+        return_attn: bool = False,
+        **kwargs,
+    ) -> tuple[Tensor, Tensor]:
         """
         input: Tensor of shape (batch_size, tgt_len)
         input_len: Tensor of shape (batch_size,)
@@ -290,17 +554,7 @@ class TransformerDecoder(Decoder):
         x = self.embed_tokens(input) * self.embed_scale
         src_len = encoder_output.size(1)
         encoder_mask = torch.arange(src_len)[None, :].to(input_len.device) >= input_len[:, None]
-        padding_mask = input.eq(PAD_IDX)
-        # shape: (batch_size, src_len)
 
-        tgt_len = input.size(1)
-        if self.future_mask.size(0) < tgt_len:
-            self.future_mask = (torch.triu(torch.ones(tgt_len, tgt_len)) != 1).transpose(0, 1)
-        self.future_mask = self.future_mask.to(x.device)
-        future_mask = self.future_mask[:tgt_len, :tgt_len]
-
-        x = x.transpose(0, 1)   # src_len first
-        encoder_output = encoder_output.transpose(0, 1)   # src_len first
         x += self.embed_positions(x, incremental=incremental)
         x = self.dropout(x)
 
@@ -308,23 +562,36 @@ class TransformerDecoder(Decoder):
             x, attn_weights = layer(
                 x,
                 encoder_output,
-                padding_mask=padding_mask,
                 encoder_mask=encoder_mask,
-                future_mask=future_mask,
                 incremental=incremental,
+                return_attn=return_attn,
             )
             if self.training:
                 attn_weights = None
 
         x = self.layer_norm(x)
-        x = x.transpose(0, 1)
-        out = torch.matmul(x, self.embed_tokens.weight.T)
+        if self.output_projection is None:
+            out = torch.matmul(x, self.embed_tokens.weight.T)
+        else:
+            out = self.output_projection(x)
+        
         return out, attn_weights
 
 
 class EncoderDecoder(nn.Module):
-    def __init__(self, encoder, decoder, lr=1e-3, label_smoothing=0, use_cuda=True, max_len=50, clip=1.0,
-                 scheduler=None, scheduler_args=None, amp=True):
+    def __init__(
+        self,
+        encoder: Encoder,
+        decoder: Decoder,
+        lr: float = 1e-3,
+        label_smoothing: float = 0.0,
+        use_cuda: bool = True,
+        max_len: int = 50,
+        clip: float = 1.0,
+        scheduler: Optional[LRScheduler] = None,
+        scheduler_args: Optional[dict] = None,
+        amp: bool = True,
+    ):
         super().__init__()
         self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
         self.encoder = encoder.to(self.device)
@@ -332,9 +599,13 @@ class EncoderDecoder(nn.Module):
         self.lr = lr
         self.max_len = max_len
         self.clip = clip
-        self.amp = amp
+        self.amp = amp  # speeds up training on recent GPU by training in float16
         scheduler_args = scheduler_args or {}
-        self.criterion = nn.CrossEntropyLoss(reduction='sum', ignore_index=PAD_IDX, label_smoothing=label_smoothing)
+        self.criterion = nn.CrossEntropyLoss(
+            reduction='sum',
+            ignore_index=decoder.pad_idx,
+            label_smoothing=label_smoothing,
+        )
 
         if scheduler is None:
             self.scheduler_fn = ReduceLROnPlateau
@@ -356,25 +627,25 @@ class EncoderDecoder(nn.Module):
         self.step_skipped = False
         self.epoch = 1
 
-        self.START = torch.LongTensor([SOS_IDX]).to(self.device)
+        self.START = torch.LongTensor([decoder.sos_idx]).to(self.device)
         self.metrics = {}
 
     @property
-    def source_dict(self):
+    def source_dict(self) -> Dictionary:
         return self.encoder.source_dict
 
     @property
-    def target_dict(self):
+    def target_dict(self) -> Dictionary:
         return self.decoder.target_dict
 
-    def reset_optimizer(self):
+    def reset_optimizer(self) -> None:
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
         self.scheduler = self.scheduler_fn(self.optimizer, **self.scheduler_args)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.amp)  # to avoid overflows with float16 training
         self.step_skipped = False
         self.epoch = 1
 
-    def vec2txt(self, vector):
+    def vec2txt(self, vector: LongTensor) -> tuple[str, list[str]]:
         """
         Convert vector to text.
         :param vector: tensor of token indices.
@@ -384,7 +655,7 @@ class EncoderDecoder(nn.Module):
             output_tokens = []
             # Remove the final END_TOKEN that is appended to predictions
             for token in vector:
-                if token == EOS_IDX:
+                if token == self.decoder.eos_idx:
                     break
                 else:
                     output_tokens.append(token)
@@ -396,7 +667,7 @@ class EncoderDecoder(nn.Module):
             "Improper input to vec2txt with dimensions {}".format(vector.size())
         )
 
-    def train_step(self, batch, train=True):
+    def train_step(self, batch: dict[str, Any], train: bool = True) -> float:
         input, input_len, target, target_len = batch['source'], batch['source_len'], batch['target'], batch['target_len']
 
         if input is None:
@@ -436,7 +707,6 @@ class EncoderDecoder(nn.Module):
             )
         scores = decoder_output.view(-1, decoder_output.size(-1))
         loss = self.criterion(scores, target.view(-1)) / target_len.sum()
-        
         if train:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -450,10 +720,10 @@ class EncoderDecoder(nn.Module):
         return loss.item()
 
     @torch.no_grad()
-    def eval_step(self, batch):
+    def eval_step(self, batch: dict[str, Any]) -> float:
         return self.train_step(batch, train=False)
 
-    def scheduler_step(self, score=None, end_of_epoch=True):
+    def scheduler_step(self, score: Optional[float] = None, end_of_epoch: bool = True) -> None:
         if end_of_epoch:
             self.epoch += 1
             
@@ -468,7 +738,7 @@ class EncoderDecoder(nn.Module):
                 self.scheduler.step()
 
     @torch.no_grad()
-    def translate(self, batch):
+    def translate(self, batch: dict[str, Any], return_attn: bool = False) -> tuple[list[str], Optional[Tensor]]:
         input, input_len = batch['source'], batch['source_len']
 
         if input is None:
@@ -505,6 +775,7 @@ class EncoderDecoder(nn.Module):
                 input_len=input_len,
                 encoder_output=encoder_output,
                 incremental=True,
+                return_attn=return_attn,
             )
 
             _, preds = decoder_output.max(dim=2)
@@ -518,7 +789,7 @@ class EncoderDecoder(nn.Module):
             for b in range(bsz):
                 if not done[b]:
                     # only add more tokens for examples that aren't done
-                    if preds[b][-1] == EOS_IDX:
+                    if preds[b][-1] == self.decoder.eos_idx:
                         # if we produced END, we're done
                         done[b] = True
                         total_done += 1
@@ -533,7 +804,7 @@ class EncoderDecoder(nn.Module):
         attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1).float().detach().cpu().numpy()
         return self.vec2txt(predictions), attn
 
-    def load(self, path, strict=True, reset_optimizer=False):
+    def load(self, path: str, strict: bool = True, reset_optimizer: bool = False) -> None:
         if not os.path.isfile(path):
             return
         
@@ -574,7 +845,7 @@ class EncoderDecoder(nn.Module):
             if ckpt.get('epoch'):
                 self.epoch = ckpt['epoch']
 
-    def save(self, path):
+    def save(self, path: str) -> None:
         dirname = os.path.dirname(path)
         if dirname:
             os.makedirs(dirname, exist_ok=True)
@@ -588,11 +859,11 @@ class EncoderDecoder(nn.Module):
         }
         torch.save(ckpt, path)
 
-    def record(self, name, value):
+    def record(self, name: str, value: float) -> None:
         self.metrics.setdefault(self.epoch, {})[name] = value
 
     @contextmanager
-    def adapter(self, id, projection_dim=64, overwrite=False):
+    def adapter(self, id: str, projection_dim: int = 64, overwrite: bool = False):
         """
         Temporarily activates adapters, for example:
         
@@ -607,97 +878,140 @@ class EncoderDecoder(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        ffn_dim: Optional[int] = None,
+        has_bias: bool = True,
+        activation: str = 'relu',
+        rms_norm: bool = False,
+    ):
         super().__init__()
+        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
         self.embed_dim = embed_dim
-        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout)
+        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, has_bias=has_bias)
         self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim)
         self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim)
+        self.fc3 = nn.Linear(embed_dim, ffn_dim, bias=has_bias) if activation == 'swiglu' else None
         self.dropout = nn.Dropout(dropout)
-        self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
-        self.final_layer_norm = nn.LayerNorm(embed_dim)
-        self.activation = activation
+        self.self_attn_layer_norm = LayerNorm(embed_dim)
+        self.final_layer_norm = LayerNorm(embed_dim)
+        self.activation_fn = F.silu if activation == 'swiglu' else getattr(F, activation)
     
-    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+    def forward(self, src: Tensor, padding_mask: Optional[BoolTensor] = None) -> Tensor:
         x = src
         residual = x
         x = self.self_attn_layer_norm(x)
-        x, _, _ = self.self_attn(
-            x, x, x, attn_mask=src_mask,
-            key_padding_mask=src_key_padding_mask)
+        x, _ = self.self_attn(x, x, x, padding_mask=padding_mask)
         x = residual + self.dropout(x)
         residual = x
         x = self.final_layer_norm(x)
-        x = self.fc2(self.dropout(self.activation(self.fc1(x))))
+        y = self.fc1(x)
+        y = self.activation_fn(y)
+        y = self.dropout(y)
+        if self.fc3 is not None:
+            y = y * self.fc3(x)
+        x = self.fc2(y)
         x = residual + self.dropout(x)
         return x
 
 
 class TransformerDecoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, dropout=0, ffn_dim=None, activation=F.relu):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        ffn_dim: Optional[int] = None,
+        has_bias: bool = True,
+        activation: str = 'relu',
+        has_encoder: bool = True,
+        rms_norm: bool = False,
+    ):
         super().__init__()
+        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
         self.embed_dim = embed_dim
-        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout)
-        self.encoder_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout)
-        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim)
-        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim)
+        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, causal=True, has_bias=has_bias)
+        self.has_encoder = has_encoder
+        if has_encoder:
+            self.encoder_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, has_bias=has_bias)
+        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim, bias=has_bias)
+        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim, bias=has_bias)
+        self.fc3 = nn.Linear(embed_dim, ffn_dim, bias=has_bias) if activation == 'swiglu' else None
         self.dropout = nn.Dropout(dropout)
-        self.self_attn_layer_norm = nn.LayerNorm(embed_dim)
-        self.encoder_attn_layer_norm = nn.LayerNorm(embed_dim)
-        self.final_layer_norm = nn.LayerNorm(embed_dim)
-        self.activation = activation
+        self.self_attn_layer_norm = LayerNorm(embed_dim)
+        if has_encoder:
+            self.encoder_attn_layer_norm = LayerNorm(embed_dim)
+        self.final_layer_norm = LayerNorm(embed_dim)
+        self.activation_fn = F.silu if activation == 'swiglu' else getattr(F, activation)
 
-    def forward(self, tgt, memory, future_mask=None, memory_mask=None,
-                padding_mask=None, encoder_mask=None, incremental=False):
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        encoder_mask: Optional[BoolTensor] = None,
+        incremental: bool = False,
+        return_attn: bool = False
+    ) -> tuple[Tensor, Optional[Tensor]]:
         x = tgt
         residual = x
         x = self.self_attn_layer_norm(x)
-        x, _, _ = self.self_attn(
-            x, x, x, attn_mask=future_mask,
-            key_padding_mask=padding_mask, incremental=incremental)
+        x, _ = self.self_attn(
+            x, x, x, incremental=incremental, return_attn=False)
         x = residual + self.dropout(x)
 
-        residual = x
-        x = self.encoder_attn_layer_norm(x)
-        x, attn_weights, _ = self.encoder_attn(
-            x, memory, memory, attn_mask=memory_mask,
-            key_padding_mask=encoder_mask)
-        x = residual + self.dropout(x)
+        if self.has_encoder:
+            residual = x
+            x = self.encoder_attn_layer_norm(x)
+            x, attn_weights = self.encoder_attn(
+                x, memory, memory, padding_mask=encoder_mask, return_attn=return_attn)
+            x = residual + self.dropout(x)
+            if attn_weights is not None:  # BxTxHxS
+                attn_weights = attn_weights.sum(dim=2) / attn_weights.size(2)  # average all attention heads
 
         residual = x
         x = self.final_layer_norm(x)
-        x = self.fc2(self.dropout(self.activation(self.fc1(x))))
+        y = self.fc1(x)
+        y = self.activation_fn(y)
+        y = self.dropout(y)
+        if self.fc3 is not None:
+            y = y * self.fc3(x)
+        x = self.fc2(y)
         x = residual + self.dropout(x)
 
         return x, attn_weights
 
 
 class PositionalEncoding(nn.Module):
-    def __init__(self, embed_dim, max_len=128):
+    def __init__(self, embed_dim: int, pad_idx: int, max_len: int = 128, shift: int = 2):
         super(PositionalEncoding, self).__init__()
-        max_len += PAD_IDX + 1   # like in fairseq
+        self.pad_idx = pad_idx
+        self.shift = shift
+        max_len += shift  # like in fairseq
         half_dim = embed_dim // 2
         weight = math.log(10000) / (half_dim - 1)
         weight = torch.exp(torch.arange(half_dim, dtype=torch.float) * -weight)
         weight = torch.arange(max_len, dtype=torch.float).unsqueeze(1) * weight.unsqueeze(0)
         weight = torch.cat([torch.sin(weight), torch.cos(weight)], dim=1).view(max_len, -1)
-        weight[PAD_IDX, :] = 0
-        self.weight = weight.unsqueeze(0).transpose(0, 1)
+        weight[pad_idx, :] = 0
+        self.weight = weight.unsqueeze(0)
         self.reset_state()
 
-    def reset_state(self):
-        self.state = PAD_IDX + 1
+    def reset_state(self) -> None:
+        self.state = self.shift
 
-    def forward(self, x, incremental=False):
-        length = x.size(0)
-        x = self.weight[self.state:self.state + length, :].to(x.device)
+    def forward(self, x: LongTensor, incremental: bool = False) -> Tensor:
+        length = x.size(1)
+        x = self.weight[:, self.state:self.state + length].to(x.device)
         if incremental:
             self.state += length
         return x
 
 
 class AdapterLayer(nn.Module):
-    def __init__(self, input_dim, projection_dim):
+    def __init__(self, input_dim: int, projection_dim: int):
         super().__init__()
         self.down = nn.Linear(input_dim, projection_dim)
         self.up = nn.Linear(projection_dim, input_dim)
@@ -707,7 +1021,7 @@ class AdapterLayer(nn.Module):
         nn.init.zeros_(self.down.bias)
         nn.init.zeros_(self.up.bias)
 
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         y = self.layer_norm(x)
         y = self.down(y)
         y = F.relu(y)
@@ -721,13 +1035,13 @@ class AdapterTransformerEncoderLayer(TransformerEncoderLayer):
         self.adapters = nn.ModuleDict({})
         self.adapter_id = None
 
-    def add_adapter(self, id, projection_dim, overwrite=False):
+    def add_adapter(self, id: str, projection_dim: int, overwrite: bool = False) -> None:
         if overwrite or id not in self.adapters:
             device = next(iter(self.parameters())).device
             adapter = AdapterLayer(self.embed_dim, projection_dim).to(device)
             self.adapters[id] = adapter
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, **kwargs) -> Tensor:
         x = super().forward(*args, **kwargs)
         if self.adapter_id is not None:
             x = self.adapters[self.adapter_id](x)
@@ -740,19 +1054,19 @@ class AdapterTransformerEncoder(TransformerEncoder):
         for param in self.parameters():
             param.requires_grad = False
 
-    def add_adapter(self, id, projection_dim, select=False, overwrite=False):
+    def add_adapter(self, id: str, projection_dim: int, select: bool = False, overwrite: bool = False) -> None:
         for layer in self.layers:
             layer.add_adapter(id, projection_dim, overwrite=overwrite)
         if select:
             self.select_adapter(id)
 
-    def select_adapter(self, id):
+    def select_adapter(self, id: str) -> None:
         for layer in self.layers:
             assert id is None or id in layer.adapters
             layer.adapter_id = id
 
-    def build_layer(self, layer_id):
-        return AdapterTransformerEncoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
+    def build_layer(self, layer_id: int) -> 'AdapterTransformerEncoderLayer':
+        return AdapterTransformerEncoderLayer(self.embed_dim, self.num_heads, self.dropout_rate, self.ffn_dim)
 
 
 class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
@@ -761,13 +1075,13 @@ class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
         self.adapters = nn.ModuleDict({})
         self.adapter_id = None
     
-    def add_adapter(self, id, projection_dim, overwrite=False):
+    def add_adapter(self, id: str, projection_dim: int, overwrite: bool = False) -> None:
         if overwrite or id not in self.adapters:
             device = next(iter(self.parameters())).device
             adapter = AdapterLayer(self.embed_dim, projection_dim).to(device)
             self.adapters[id] = adapter
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args, **kwargs) -> tuple[Tensor, Optional[Tensor]]:
         x, attn = super().forward(*args, **kwargs)
         if self.adapter_id is not None:
             x = self.adapters[self.adapter_id](x)
@@ -780,23 +1094,30 @@ class AdapterTransformerDecoder(TransformerDecoder):
         for param in self.parameters():
             param.requires_grad = False
 
-    def add_adapter(self, id, projection_dim, select=False, overwrite=False):
+    def add_adapter(self, id: str, projection_dim: int, select: bool = False, overwrite: bool = False) -> None:
         for layer in self.layers:
             layer.add_adapter(id, projection_dim, overwrite=overwrite)
         if select:
             self.select_adapter(id)
 
-    def select_adapter(self, id):
+    def select_adapter(self, id: str) -> None:
         for layer in self.layers:
             assert id is None or id in layer.adapters
             layer.adapter_id = id
 
-    def build_layer(self, layer_id):
-        return AdapterTransformerDecoderLayer(self.embed_dim, self.heads, self.dropout_rate, self.ffn_dim)
+    def build_layer(self, layer_id: int) -> 'AdapterTransformerDecoderLayer':
+        return AdapterTransformerDecoderLayer(self.embed_dim, self.num_heads, self.dropout_rate, self.ffn_dim)
 
 
-class WarmupLR(torch.optim.lr_scheduler._LRScheduler):
-    def __init__(self, optimizer, last_epoch=-1, warmup=1000, init_lr=0.0, verbose=False):
+class WarmupLR(LRScheduler):
+    def __init__(
+        self,
+        optimizer: optim.Optimizer,
+        last_epoch: int = -1,
+        warmup: int = 1000,
+        init_lr: float = 0.0,
+        verbose: bool = False,
+    ):
         self.warmup = warmup
         self.init_lr = init_lr
         param_group = next(iter(optimizer.param_groups))
@@ -807,7 +1128,7 @@ class WarmupLR(torch.optim.lr_scheduler._LRScheduler):
         self.decay_factor = self.lr * self.warmup ** 0.5
         super(WarmupLR, self).__init__(optimizer, last_epoch, verbose)
 
-    def get_lr(self):
+    def get_lr(self) -> list[float]:
         if self.last_epoch < self.warmup:
             lr = self.init_lr + self.last_epoch * self.lr_step
         else:

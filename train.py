@@ -160,9 +160,19 @@ for lang_pair in lang_pairs:
 
     reset_seed()
 
-    train_iterator = data.BatchIterator(train_data[lang_pair], src, tgt, batch_size=args.batch_size, max_len=args.max_len, shuffle=True)
+    train_iterator = data.BatchIterator(
+        train_data[lang_pair], src, tgt,
+        batch_size=args.batch_size,
+        max_len=args.max_len,
+        shuffle=True,
+    )
     train_iterators.append(train_iterator)
-    valid_iterator = data.BatchIterator(valid_data[lang_pair], src, tgt, batch_size=args.batch_size, max_len=args.max_len, shuffle=False)
+    valid_iterator = data.BatchIterator(
+        valid_data[lang_pair], src, tgt,
+        batch_size=args.batch_size,
+        max_len=args.max_len,
+        shuffle=False,
+    )
     valid_iterators.append(valid_iterator)
 
 if len(train_iterator) > 1:
@@ -299,8 +309,8 @@ elif args.model_type == 'rnn':
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 else:
-    encoder = models.TransformerEncoder(**encoder_args, heads=args.heads)
-    decoder = models.TransformerDecoder(**decoder_args, heads=args.heads)
+    encoder = models.TransformerEncoder(**encoder_args, num_heads=args.heads)
+    decoder = models.TransformerDecoder(**decoder_args, num_heads=args.heads)
 
 if args.shared_embeddings:
     decoder.embed_tokens = encoder.embed_tokens
