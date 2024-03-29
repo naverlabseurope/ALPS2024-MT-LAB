@@ -27,10 +27,53 @@ class Tokenizer:
     @functools.lru_cache(maxsize=10**6)  # to speed up tokenization of already-seen sentences
     def tokenize(self, line: str) -> str:
         line = line or ''  # to also work with None
-        return ' '.join(self._tokenize(word) for word in line.split())
+        return ' '.join(self._tokenize(word) for word in line.split(' '))
     
-    def detokenize(self, line: str) -> str:
-        return line.replace(' ', '').replace('▁', ' ').strip()
+    def detokenize(self, line: str, strip: bool = True) -> str:
+        has_prefix = line and line[0] == '▁'
+        line = self.model.DecodePieces(line.split())
+        if strip:
+            line = line.strip()
+        elif has_prefix:  # the SentencePiece tokenizer removes the whitespace at the beginning, but we may want to
+            # keep it (e.g., when detokenizing tokens on the fly)
+            line = ' ' + line
+        return line
+
+    def get_dictionary(
+        self,
+        sos_idx: Optional[int] = None,
+        eos_idx: Optional[int] = None,
+        unk_idx: Optional[int] = None,
+        pad_idx: Optional[int] = None,
+        vocab_size: Optional[int] = None,
+    ) -> 'Dictionary':
+        # Automatically build a dictionary from sentencepiece model. Useful for dealing with HuggingFace models
+        # that don't have a "dict.txt" file.
+        vocab_size = vocab_size or self.model.vocab_size()
+        if sos_idx is None:
+            sos_idx = self.model.bos_id()
+        if eos_idx is None:
+            eos_idx = self.model.eos_id()
+        if unk_idx is None:
+            unk_idx = self.model.unk_id()
+        if pad_idx is None:
+            pad_idx = self.model.pad_id()
+        if pad_idx < 0:  # sometimes -1
+            pad_idx = unk_idx  # should be different than sos and eos because pad tokens are ignored at training
+        dictionary = Dictionary(
+            minimum_count=1,
+            unk_idx=unk_idx,
+            sos_idx=sos_idx,
+            eos_idx=eos_idx,
+            pad_idx=pad_idx,
+            shift=0,
+        )
+        for token_id in range(self.model.vocab_size()):
+            token = self.model.IdToPiece(token_id)
+            dictionary.add_symbol(token)
+        for token_id in range(self.model.vocab_size(), vocab_size):
+            dictionary.add_symbol(f'<dummy_{token_id}>')
+        return dictionary
 
 
 class Dictionary:
@@ -137,22 +180,29 @@ class Dictionary:
 def binarize(
     dataset: pd.DataFrame,
     source_dict: Dictionary,
-    target_dict: Dictionary, sort: bool = True,
+    target_dict: Dictionary,
+    sort: bool = True,
 ) -> bool:
-    for key in 'source', 'target', 'prefix':
+    def safe_len(arr):
+        return 0 if arr is None else len(arr)
+
+    for key in 'source', 'target', 'prompt':
         dictionary = source_dict if key == 'source' else target_dict
 
         indices = []
         for tokens in dataset[key + '_tokenized']:
-            indices.append(dictionary.txt2vec(tokens, add_eos=(key != 'prefix')))
+            indices.append(
+                None if tokens is None else
+                dictionary.txt2vec(tokens, add_eos=(key != 'prompt'))
+            )
 
         dataset[key + '_bin'] = indices
-        dataset[key + '_len'] = dataset[key + '_bin'].apply(len) 
+        dataset[key + '_len'] = dataset[key + '_bin'].apply(safe_len)
 
     dataset[:] = dataset[
         np.logical_and(
-            dataset['source_len'] >= 2,
-            dataset['target_len'] >= 2
+            np.logical_or(dataset['source_bin'].isnull(), dataset['source_len'] >= 2),
+            dataset['target_len'] >= 2,
         )
     ]
 
@@ -175,8 +225,9 @@ def load_or_create_dictionary(dict_path: str, dataset: pd.DataFrame, reset: bool
     return dictionary
 
 
-def load_dataset(
-    path: str,
+def make_dataset(
+    source_lines: Iterator[str],
+    target_lines: Iterator[str],
     source_lang: Optional[str],
     target_lang: Optional[str],
     preprocess: Optional[Callable] = None,
@@ -185,6 +236,7 @@ def load_dataset(
     dataset = pd.DataFrame()
 
     def preprocess_and_split(source_line, target_line):
+        prompt = None
         if preprocess is not None:
             out = preprocess(
                 source_line, target_line,
@@ -195,43 +247,59 @@ def load_dataset(
             if not out:
                 return None
             
-            source_line, target_line, *prefix = out
-            # preprocess can return (source, target) or (source, target, prefix)
-            prefix = prefix[0] if prefix else None
-        
-        return source_line, target_line, prefix
+            source_line, target_line, *prompt = out
+            # preprocess can return (source, target) or (source, target, prompt)
+            prompt = prompt[0] if prompt else None
+        return source_line, target_line, prompt
 
-    with open(f'{path}.{source_lang}') as source_file, open(f'{path}.{target_lang}') as target_file:
-        source_data = []
-        target_data = []
+    source_data = []
+    target_data = []
 
-        source_tokenized = []
-        target_tokenized = []
-        prefix_tokenized = []
-        
-        for source_line, target_line in zip(source_file, target_file):
-            # if filter_fn is None or filter_fn(source_line, target_line):
-            source_line, target_line = source_line.strip(), target_line.strip()
-            tok_pair = preprocess_and_split(source_line, target_line)
-            if not tok_pair:   # if 'preprocess' returns None, this means that we filter out this example
-                continue
-            src_tok, tgt_tok, prefix = tok_pair
-            source_data.append(source_line)
-            target_data.append(target_line)
-            source_tokenized.append(src_tok)
-            target_tokenized.append(tgt_tok)
-            prefix_tokenized.append(prefix)
+    source_tokenized = []
+    target_tokenized = []
+    prompt_tokenized = []
+    
+    for source_line, target_line in zip(source_lines, target_lines):
+        # if filter_fn is None or filter_fn(source_line, target_line):
+        source_line, target_line = source_line.strip(), target_line.strip()
+        tok_pair = preprocess_and_split(source_line, target_line)
+        if not tok_pair:   # if 'preprocess' returns None, this means that we filter out this example
+            continue
+        src_tok, tgt_tok, prompt = tok_pair
+        source_data.append(source_line)
+        target_data.append(target_line)
+        source_tokenized.append(src_tok)
+        target_tokenized.append(tgt_tok)
+        prompt_tokenized.append(prompt)
 
-            if max_size and len(source_data) == max_size:
-                break
-        
-        dataset['source_data'] = source_data
-        dataset['target_data'] = target_data
-        dataset['source_tokenized'] = source_tokenized
-        dataset['target_tokenized'] = target_tokenized
-        dataset['prefix_tokenized'] = prefix_tokenized
+        if max_size and len(source_data) == max_size:
+            break
+    
+    dataset['source_data'] = source_data
+    dataset['target_data'] = target_data
+    dataset['source_tokenized'] = source_tokenized
+    dataset['target_tokenized'] = target_tokenized
+    dataset['prompt_tokenized'] = prompt_tokenized
 
     return dataset
+
+
+def load_dataset(
+    path: str,
+    source_lang: Optional[str],
+    target_lang: Optional[str],
+    preprocess: Optional[Callable] = None,
+    max_size: Optional[int] = None,
+) -> pd.DataFrame:
+    with open(f'{path}.{source_lang}') as source_file, open(f'{path}.{target_lang}') as target_file:
+        return make_dataset(
+            source_file,
+            target_file,
+            source_lang,
+            target_lang,
+            preprocess=preprocess,
+            max_size=max_size,
+        )
 
 
 def concatenate_datasets(datasets: list[pd.DataFrame]) -> pd.DataFrame:
@@ -247,6 +315,7 @@ class BatchIterator:
         batch_size: int,
         max_len: int,
         shuffle: bool = True,
+        source_as_prompt: bool = False,
     ):
         self.source_lang = source_lang
         self.target_lang = target_lang
@@ -263,10 +332,17 @@ class BatchIterator:
                 'source': data.iloc[idx]['source_bin'],
                 'target': data.iloc[idx]['target_bin'],
                 'reference': data.iloc[idx]['target_data'],
-                'prefix': data.iloc[idx]['prefix_bin'],
+                'prompt': data.iloc[idx]['prompt_bin'],
             }
 
-            size = max(len(sample['source']), len(sample['target']))
+            source = sample['source']
+            target = sample['target']
+            if source is None:
+                size = len(target)
+            elif source_as_prompt:
+                size = len(source) + len(target)
+            else:
+                size = max(len(source), len(target))
             
             if size > batch_size:
                 continue
@@ -283,7 +359,7 @@ class BatchIterator:
         if batch:
             batches.append(batch)
 
-        self.batches = [collate(batch, max_len, pad_idx) for batch in batches]
+        self.batches = [collate(batch, max_len, pad_idx, source_as_prompt) for batch in batches]
         self.shuffle = shuffle
 
     def __len__(self) -> int:
@@ -307,19 +383,23 @@ class MultilingualBatchIterator(BatchIterator):
         self.target_lang = 'tgt'
 
 
-def collate(batch: dict[str, Any], max_len: int, pad_idx: int) -> dict[str, Any]:
+def collate(batch: dict[str, Any], max_len: int, pad_idx: int, source_as_prompt: bool = False) -> dict[str, Any]:
     # This function takes a batch containing samples of varying lengths and concatenates these samples 
     # into same length sequences by padding them to the maximum length
     empty_seq = np.array([], np.int64)
-    # TODO: concatenate source and target here?
-    source = [sample.get('source', empty_seq) for sample in batch]
-    target = [sample.get('target', empty_seq) for sample in batch]
-    prefix = [sample.get('prefix', empty_seq) for sample in batch]
-    assert len(set(map(len, prefix))) == 1, 'all prefixes should have the same length'
+    source = [empty_seq if (x := sample.get('source')) is None else x for sample in batch]
+    target = [empty_seq if (x := sample.get('target')) is None else x for sample in batch]
+    prompt = [empty_seq if (x := sample.get('prompt')) is None else x for sample in batch]
+
+    if source_as_prompt:
+        prompt = [np.concatenate([prt, src]) for prt, src in zip(prompt, source)]
+        target = [np.concatenate([src, tgt]) for src, tgt in zip(source, target)]
+        source = [empty_seq for _ in batch]
 
     reference = [sample.get('reference') for sample in batch]
     max_source_len = min(max(map(len, source)), max_len)
     max_target_len = min(max(map(len, target)), max_len)
+    max_prompt_len = min(max(map(len, prompt)), max_len)
 
     def pad(seq: np.ndarray, max_len: int) -> tuple[np.ndarray, int]:
         seq = np.array(seq)
@@ -338,13 +418,14 @@ def collate(batch: dict[str, Any], max_len: int, pad_idx: int) -> dict[str, Any]
 
     source, source_len = zip(*[pad(x, max_source_len) for x in source])
     target, target_len = zip(*[pad(x, max_target_len) for x in target])
+    prompt, _ = zip(*[pad(x, max_prompt_len) for x in prompt])
     
     batch = {
         'source': torch.tensor(np.array(source)),
         'target': torch.tensor(np.array(target)),
         'source_len': torch.tensor(np.array(source_len)),
         'target_len': torch.tensor(np.array(target_len)),
-        'prefix': torch.tensor(np.array(prefix)),
+        'prompt': torch.tensor(np.array(prompt)),  # only used at inference
         'reference': reference,
     }
     return batch

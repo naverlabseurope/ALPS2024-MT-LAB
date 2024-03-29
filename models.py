@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 from torch import optim
 import torch.nn as nn
@@ -7,12 +8,16 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, LRScheduler
 from torch import Tensor, BoolTensor, LongTensor
 import math
 import functools
-from typing import Optional, Union, Any
+from typing import Optional, Union, Any, Iterator
 from data import Dictionary
 from contextlib import contextmanager
 
 
 def checkpoint(module: nn.Module):
+    """
+    Apply activation checkpointing to this module (i.e., activation are not stored to save GPU memory, but are 
+    recomputed during the backward pass)
+    """
     module._orig_forward = module.forward
     from torch.utils.checkpoint import checkpoint
     module.forward = functools.partial(checkpoint, module._orig_forward, use_reentrant=False)
@@ -20,7 +25,7 @@ def checkpoint(module: nn.Module):
 
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
@@ -89,6 +94,8 @@ class Decoder(nn.Module):
     def select_adapter(self, id: str) -> None:
         pass
 
+    def reset_state(self) -> None:
+        self.state = None
 
 
 class MultiheadAttention(nn.Module):  # copied from Pasero
@@ -343,15 +350,16 @@ class BOW_Encoder(Encoder):
         for _ in range(self.num_layers - 1):
             self.layers.append(nn.Linear(self.embed_dim, self.embed_dim))
 
-    def forward(self, input: LongTensor, input_len: LongTensor, **kwargs):
-        x = self.embed_tokens(input)
+    def forward(self, encoder_input: LongTensor, **kwargs) -> tuple[Tensor, BoolTensor]:
+        x = self.embed_tokens(encoder_input)
 
         for layer in self.layers:
             x = layer(x)
             x = self.activation(x)
             x = self.dropout(x)
         
-        mask = torch.arange(input.size(1))[None, :].to(input_len.device) < input_len[:, None]
+        mask = (encoder_input != self.pad_idx)
+        input_len = mask.sum(dim=1)
         x = x * mask.unsqueeze(-1)
 
         if self.reduce == "mean":
@@ -361,7 +369,7 @@ class BOW_Encoder(Encoder):
         else:
             x = x.sum(dim=1)
 
-        return x.unsqueeze(1)
+        return x.unsqueeze(1), ~mask
 
 
 class RNN_Encoder(Encoder):
@@ -372,17 +380,19 @@ class RNN_Encoder(Encoder):
             dropout=self.dropout_rate if self.num_layers > 1 else 0
         )
 
-    def forward(self, input: LongTensor, input_len: LongTensor, **kwargs):
+    def forward(self, encoder_input: LongTensor, **kwargs) -> tuple[Tensor, BoolTensor]:
         """Return encoded state.
-        :param input: (batch_size x seqlen) tensor of token indices.
+        :param encoder_input: (batch_size x seqlen) tensor of token indices.
         """
-        x = self.embed_tokens(input)
+        x = self.embed_tokens(encoder_input)
         x = self.dropout(x)
+        mask = (encoder_input == self.pad_idx)
+        input_len = (~mask).sum(dim=1)
         x = torch.nn.utils.rnn.pack_padded_sequence(x, input_len.cpu(), batch_first=True, enforce_sorted=False)
         x, _ = self.gru(x)
         x, _ = torch.nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
         x = self.dropout(x)
-        return x
+        return x, mask
 
 
 class RNN_Decoder(Decoder):
@@ -395,30 +405,28 @@ class RNN_Decoder(Decoder):
         self.out = nn.Linear(self.embed_dim, self.output_size)
         self.reset_state()
 
-    def reset_state(self) -> None:
-        self.state = None
-
     def forward(
         self,
-        input: LongTensor,
-        input_len: LongTensor,
+        decoder_input: LongTensor,
         encoder_output: Tensor,
+        encoder_mask: BoolTensor,
         incremental: bool = False,
         **kwargs,
     ) -> tuple[Tensor, None]:
         """Return encoded state.
-        :param input: batch_size x tgt_len tensor of token indices.
+        :param decoder_input: batch_size x tgt_len tensor of token indices.
         """
-        bsz = input.size(0)
-        tgt_len = input.size(1)
+        bsz = decoder_input.size(0)
+        tgt_len = decoder_input.size(1)
         
-        x = self.embed_tokens(input)       # BxTxH
+        x = self.embed_tokens(decoder_input)       # BxTxH
         x = self.dropout(x)
 
+        encoder_input_len = (~encoder_mask).sum(dim=1)
         if encoder_output.size(1) == 1:
             y = encoder_output
         else:
-            y = encoder_output[torch.arange(bsz), input_len -1].unsqueeze(1)
+            y = encoder_output[torch.arange(bsz), encoder_input_len - 1].unsqueeze(1)
         y = y.repeat(1, tgt_len, 1)
         x = torch.cat([x, y], dim=-1)
 
@@ -430,132 +438,296 @@ class RNN_Decoder(Decoder):
         return x, None
 
 
-class TransformerEncoder(Encoder):
+class TransformerEncoderLayer(nn.Module):
     def __init__(
         self,
-        *args,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        ffn_dim: Optional[int] = None,
+        has_bias: bool = True,
+        activation: str = 'relu',
+        rms_norm: bool = False,
+        rope: bool = False,
+    ):
+        super().__init__()
+        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
+        self.embed_dim = embed_dim
+        self.self_attn = MultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout=dropout,
+            has_bias=has_bias,
+            rope=rope,
+        )
+        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim)
+        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim)
+        self.fc3 = nn.Linear(embed_dim, ffn_dim, bias=has_bias) if activation == 'swiglu' else None
+        self.dropout = nn.Dropout(dropout)
+        self.self_attn_layer_norm = LayerNorm(embed_dim)
+        self.final_layer_norm = LayerNorm(embed_dim)
+        self.activation_fn = F.silu if activation == 'swiglu' else getattr(F, activation)
+    
+    def forward(self, src: Tensor, padding_mask: Optional[BoolTensor] = None) -> Tensor:
+        x = src
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        x, _ = self.self_attn(x, x, x, padding_mask=padding_mask)
+        x = residual + self.dropout(x)
+        residual = x
+        x = self.final_layer_norm(x)
+        y = self.fc1(x)
+        y = self.activation_fn(y)
+        y = self.dropout(y)
+        if self.fc3 is not None:
+            y = y * self.fc3(x)
+        x = self.fc2(y)
+        x = residual + self.dropout(x)
+        return x
+
+
+class TransformerDecoderLayer(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        num_heads: int,
+        dropout: float = 0.0,
+        ffn_dim: Optional[int] = None,
+        has_bias: bool = True,
+        activation: str = 'relu',
+        has_encoder: bool = True,
+        rms_norm: bool = False,
+        rope: bool = False,
+        kv_heads: Optional[int] = None,
+    ):
+        super().__init__()
+        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
+        self.embed_dim = embed_dim
+        self.self_attn = MultiheadAttention(
+            embed_dim,
+            num_heads,
+            dropout=dropout,
+            causal=True,
+            has_bias=has_bias,
+            rope=rope,
+            kv_heads=kv_heads,
+        )
+        self.has_encoder = has_encoder
+        if has_encoder:
+            self.encoder_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, has_bias=has_bias)
+        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim, bias=has_bias)
+        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim, bias=has_bias)
+        self.fc3 = nn.Linear(embed_dim, ffn_dim, bias=has_bias) if activation == 'swiglu' else None
+        self.dropout = nn.Dropout(dropout)
+        self.self_attn_layer_norm = LayerNorm(embed_dim)
+        if has_encoder:
+            self.encoder_attn_layer_norm = LayerNorm(embed_dim)
+        self.final_layer_norm = LayerNorm(embed_dim)
+        self.activation_fn = F.silu if activation == 'swiglu' else getattr(F, activation)
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        encoder_mask: Optional[BoolTensor] = None,
+        incremental: bool = False,
+        return_attn: bool = False
+    ) -> tuple[Tensor, Optional[Tensor]]:
+        x = tgt
+        residual = x
+        x = self.self_attn_layer_norm(x)
+        x, _ = self.self_attn(
+            x, x, x, incremental=incremental, return_attn=False)
+        x = residual + self.dropout(x)
+
+        if self.has_encoder:
+            residual = x
+            x = self.encoder_attn_layer_norm(x)
+            x, attn_weights = self.encoder_attn(
+                x, memory, memory, padding_mask=encoder_mask, return_attn=return_attn)
+            x = residual + self.dropout(x)
+            if attn_weights is not None:  # BxTxHxS
+                attn_weights = attn_weights.sum(dim=2) / attn_weights.size(2)  # average all attention heads
+        else:
+            attn_weights = None
+
+        residual = x
+        x = self.final_layer_norm(x)
+        y = self.fc1(x)
+        y = self.activation_fn(y)
+        y = self.dropout(y)
+        if self.fc3 is not None:
+            y = y * self.fc3(x)
+        x = self.fc2(y)
+        x = residual + self.dropout(x)
+
+        return x, attn_weights
+
+
+class TransformerEncoder(Encoder):
+    layer_cls = TransformerEncoderLayer
+
+    def __init__(
+        self,
+        source_dict: Dictionary,
+        embed_dim: int = 512,
+        num_layers: int = 1,
+        dropout: float = 0.0,
         num_heads: int = 4,
         ffn_dim: Optional[int] = None,
         checkpointing: bool = False,
         has_bias: bool = True,
-        has_encoder: bool = True,
         activation: str = 'relu',
         rms_norm: bool = False,
+        rope: bool = False,
+        scale_embed: bool = True,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            source_dict=source_dict,
+            embed_dim=embed_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+        )
         LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim or self.embed_dim
-        self.embed_positions = PositionalEncoding(self.embed_dim, self.pad_idx)
-        self.has_encoder = has_encoder
+        self.embed_positions = None if rope else PositionalEncoding(self.embed_dim, self.pad_idx)
         self.has_bias = has_bias
         self.activation = activation
         self.rms_norm = rms_norm
-        self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
+        self.rope = rope
+        self.layers = nn.ModuleList(
+            [
+                self.layer_cls(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    ffn_dim=ffn_dim,
+                    has_bias=has_bias,
+                    activation=activation,
+                    rms_norm=rms_norm,
+                    rope=rope,
+                    **kwargs,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
         if checkpointing:
             for layer in self.layers:
                 checkpoint(layer)
         self.layer_norm = LayerNorm(self.embed_dim)
-        self.embed_scale = math.sqrt(self.embed_dim)
+        self.embed_scale = math.sqrt(self.embed_dim) if scale_embed else 1
         self.dropout = nn.Dropout(self.dropout_rate)
-    
-    def build_layer(self, layer_id: int) -> 'TransformerEncoderLayer':
-        return TransformerEncoderLayer(
-            self.embed_dim,
-            self.num_heads,
-            self.dropout_rate,
-            self.ffn_dim,
-            has_bias=self.has_bias,
-            activation=self.activation,
-            rms_norm=self.rms_norm,
-        )
 
-    def forward(self, input: LongTensor, input_len: int, **kwargs) -> Tensor:
-        x = self.embed_tokens(input) * self.embed_scale
+    def forward(self, encoder_input: LongTensor, **kwargs) -> tuple[Tensor, BoolTensor]:
+        x = self.embed_tokens(encoder_input) * self.embed_scale
 
-        mask = torch.arange(input.size(1))[None, :].to(input_len.device) >= input_len[:, None]
-        # shape: (batch_size, src_len)
+        mask = (encoder_input == self.pad_idx)  # shape: (batch_size, src_len)
 
-        x += self.embed_positions(x)
+        if self.embed_positions is not None:
+            x += self.embed_positions(x)
         x = self.dropout(x)
 
         for layer in self.layers:
             x = layer(x, padding_mask=mask)
 
-        return self.layer_norm(x)
+        return self.layer_norm(x), mask
 
 
 class TransformerDecoder(Decoder):
+    layer_cls = TransformerDecoderLayer
+
     def __init__(
-        self, *args,
+        self,
+        target_dict: Dictionary,
+        embed_dim: int = 512,
+        num_layers: int = 1,
+        dropout: float = 0.0,
+        embed_tokens: Optional[nn.Embedding] = None,
         num_heads: int = 4,
         ffn_dim: Optional[int] = None,
-        checkpointing: bool = False,
+        checkpointing: bool = False,  # save GPU memory by recomputing activations during the backward pass
         has_bias: bool = True,
         has_encoder: bool = True,
         activation: str = 'relu',
         rms_norm: bool = False,
-        tied_embed: bool = True,
+        tied_embed: bool = True,  # use the same weights for embeddings and vocabulary projection
+        rope: bool = False,  # rotary positional encoding (instead of absolute sinusoidal encoding)
+        kv_heads: Optional[int] = None,
+        scale_embed: bool = True,
         **kwargs,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            target_dict,
+            embed_dim=embed_dim,
+            num_layers=num_layers,
+            dropout=dropout,
+            embed_tokens=embed_tokens,
+        )
         LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
         self.num_heads = num_heads
         self.ffn_dim = ffn_dim or self.embed_dim
-        self.embed_positions = PositionalEncoding(self.embed_dim, self.pad_idx)  # TODO (Llama)
+        self.embed_positions = None if rope else PositionalEncoding(self.embed_dim, self.pad_idx)
         self.has_encoder = has_encoder
         self.has_bias = has_bias
         self.activation = activation
         self.rms_norm = rms_norm
-        self.layers = nn.ModuleList([self.build_layer(i) for i in range(self.num_layers)])
+        self.rope = rope
+        self.kv_heads = kv_heads
+        self.layers = nn.ModuleList(
+            [
+                self.layer_cls(
+                    embed_dim=embed_dim,
+                    num_heads=num_heads,
+                    dropout=dropout,
+                    ffn_dim=ffn_dim,
+                    has_bias=has_bias,
+                    activation=activation,
+                    rms_norm=rms_norm,
+                    rope=rope,
+                    kv_heads=kv_heads,
+                    has_encoder=has_encoder,
+                    **kwargs,
+                )
+                for _ in range(self.num_layers)
+            ]
+        )
         if checkpointing:
             for layer in self.layers:
                 checkpoint(layer)
         self.layer_norm = LayerNorm(self.embed_dim)
         self.output_projection = (
             None if tied_embed else
-            nn.Linear(self.embed_dim, self.embed_tokens.num_embeddings, has_bias=False)
+            nn.Linear(self.embed_dim, self.embed_tokens.num_embeddings, bias=False)
         )
-        self.embed_scale = math.sqrt(self.embed_dim)
+        self.embed_scale = math.sqrt(self.embed_dim) if scale_embed else 1
         self.dropout = nn.Dropout(self.dropout_rate)
 
-    def build_layer(self, layer_id: int) -> 'TransformerDecoderLayer':
-        return TransformerDecoderLayer(
-            self.embed_dim,
-            self.num_heads,
-            self.dropout_rate,
-            self.ffn_dim,
-            has_bias=self.has_bias,
-            has_encoder=self.has_encoder,
-            activation=self.activation,
-            rms_norm=self.rms_norm,
-        )
-
     def reset_state(self) -> None:
-        self.embed_positions.reset_state()
+        if self.embed_positions is not None:
+            self.embed_positions.reset_state()
         for layer in self.layers:
             layer.self_attn.reset_state()
 
     def forward(
         self,
-        input: LongTensor,
-        input_len: LongTensor,
-        encoder_output: Tensor,
+        decoder_input: LongTensor,
+        encoder_output: Optional[Tensor],
+        encoder_mask: Optional[BoolTensor] = None,
         incremental: bool = False,
         return_attn: bool = False,
         **kwargs,
     ) -> tuple[Tensor, Tensor]:
         """
-        input: Tensor of shape (batch_size, tgt_len)
-        input_len: Tensor of shape (batch_size,)
+        decoder_input: Tensor of shape (batch_size, tgt_len)
         encoder_output: Tensor of shape (batch_size, src_len, embed_dim)
+        encoder_mask: Tensor of shape (batch_size, src_len)
         """
-        x = self.embed_tokens(input) * self.embed_scale
-        src_len = encoder_output.size(1)
-        encoder_mask = torch.arange(src_len)[None, :].to(input_len.device) >= input_len[:, None]
+        x = self.embed_tokens(decoder_input) * self.embed_scale
 
-        x += self.embed_positions(x, incremental=incremental)
+        if self.embed_positions is not None:
+            x += self.embed_positions(x, incremental=incremental)
         x = self.dropout(x)
 
         for layer in self.layers:
@@ -594,7 +766,7 @@ class EncoderDecoder(nn.Module):
     ):
         super().__init__()
         self.device = 'cuda' if (torch.cuda.is_available() and use_cuda) else 'cpu'
-        self.encoder = encoder.to(self.device)
+        self.encoder = None if encoder is None else encoder.to(self.device)
         self.decoder = decoder.to(self.device)
         self.lr = lr
         self.max_len = max_len
@@ -615,7 +787,8 @@ class EncoderDecoder(nn.Module):
                 factor=0.1,      # when chrF plateaus, divide learning rate by 10
                 threshold=0.5,   # reduce LR if chrF is lower than best chrF + 0.5 (i.e., if does not improve enough)
                 threshold_mode='abs',
-                verbose=True)
+                verbose=True,
+            )
             dict.update(scheduler_args)   # can partially change the default values
         else:
             # can specify a different scheduler (e.g., ExponentialLR)
@@ -627,12 +800,12 @@ class EncoderDecoder(nn.Module):
         self.step_skipped = False
         self.epoch = 1
 
-        self.START = torch.LongTensor([decoder.sos_idx]).to(self.device)
+        self.start = torch.LongTensor([decoder.sos_idx]).to(self.device)
         self.metrics = {}
 
     @property
     def source_dict(self) -> Dictionary:
-        return self.encoder.source_dict
+        return self.target_dict if self.encoder is None else self.encoder.source_dict
 
     @property
     def target_dict(self) -> Dictionary:
@@ -668,45 +841,49 @@ class EncoderDecoder(nn.Module):
         )
 
     def train_step(self, batch: dict[str, Any], train: bool = True) -> float:
-        input, input_len, target, target_len = batch['source'], batch['source_len'], batch['target'], batch['target_len']
+        source, target = batch['source'], batch['target']
 
-        if input is None:
+        if source is None or target is None:
             return
 
         if train and self.optimizer is None:
             self.reset_optimizer()
 
-        input = input.to(self.device)
+        source = source.to(self.device)
         target = target.to(self.device)
-        input_len = input_len.to(self.device)
-        target_len = target_len.to(self.device)
 
-        bsz = input.size(0)
-        start = self.START.expand(bsz, 1)
+        bsz = target.size(0)
+        start = self.start.expand(bsz, 1)
         loss = 0
         if train:
             self.optimizer.zero_grad(set_to_none=True)
-            self.encoder.train()
+            if self.encoder is not None:
+                self.encoder.train()
             self.decoder.train()
         else:
-            self.encoder.eval()
+            if self.encoder is not None:
+                self.encoder.eval()
             self.decoder.eval()
 
         with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=(self.amp and train)):
-            encoder_output = self.encoder(input, input_len=input_len)
+            if self.encoder is None:
+                encoder_output = encoder_mask = None
+            else:
+                encoder_output, encoder_mask = self.encoder(source)
 
-        # Teacher forcing: Feed the target as the next input
-        shifted_target = target.narrow(1, 0, target.size(1) - 1)
-        decoder_input = torch.cat([start, shifted_target], 1)
+        # Teacher forcing: feed the target as the next input
+        shifted_target = target[:,:-1]
+        decoder_input = torch.cat([start, shifted_target], dim=1)
 
         with torch.autocast(device_type=self.device, dtype=torch.float16, enabled=(self.amp and train)):
             decoder_output, _ = self.decoder(
-                input=decoder_input,
-                input_len=input_len,
+                decoder_input=decoder_input,
                 encoder_output=encoder_output,
+                encoder_mask=encoder_mask,
             )
         scores = decoder_output.view(-1, decoder_output.size(-1))
-        loss = self.criterion(scores, target.view(-1)) / target_len.sum()
+        num_tokens = (target != self.decoder.pad_idx).sum()
+        loss = self.criterion(scores, target.view(-1)) / num_tokens
         if train:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
@@ -738,78 +915,142 @@ class EncoderDecoder(nn.Module):
                 self.scheduler.step()
 
     @torch.no_grad()
-    def translate(self, batch: dict[str, Any], return_attn: bool = False) -> tuple[list[str], Optional[Tensor]]:
-        input, input_len = batch['source'], batch['source_len']
+    def stream(self, batch: dict[str, Any], return_attn: bool = False) -> Iterator[tuple[LongTensor, Optional[Tensor]]]:
+        source, prompt = batch['source'], batch['prompt']
 
-        if input is None:
-            return
+        source = source.to(self.device)
+        prompt = prompt.to(self.device)
 
-        input = input.to(self.device)
-        input_len = input_len.to(self.device)
-
-        bsz = input.size(0)
-        bos = self.START.expand(bsz, 1)  # expand to batch size
-        prefix = batch.get('prefix')
-
-        if prefix is None:
-            prefix = bos
+        if self.encoder is None:
+            assert source.size(1) > 0 or prompt.size(1) > 0, 'decoder-only models require a source or a prompt'
+            if source.size(1) > 0 and prompt.size(1) > 0:
+                assert not (prompt == self.decoder.pad_idx).any(), 'padding in the middle is incompatible with ' \
+                    'causal masking'
+            prompt = torch.cat([prompt, source], dim=1)
+            bsz = prompt.size(0)
+            bos = self.start.expand(bsz, 1)
+            decoder_input = torch.cat([bos, prompt], dim=1)
+            encoder_output = encoder_mask = None
         else:
-            prefix = prefix.to(self.device)
-            prefix = torch.cat([bos, prefix], dim=1)
+            assert source.size(1) > 0, 'encoder-decoder models require a source'
+            bsz = source.size(0)
+            bos = self.start.expand(bsz, 1).to(prompt)
+            decoder_input = torch.cat([bos, prompt], dim=1)
+            self.encoder.eval()
+            # not doing autocast here: for some reason here AMP is slower than full precision here
+            encoder_output, encoder_mask = self.encoder(source)
 
-        self.encoder.eval()
+        assert decoder_input.size(1) < self.max_len
+
+        prompt_len = (decoder_input != self.decoder.pad_idx).sum(dim=1)
+        start = prompt_len.min()
+        start = min(start, self.max_len - 1)  # to ensure that we do at least one decoding step
+
+        tokens = torch.full(
+            (bsz, self.max_len),
+            self.decoder.pad_idx,
+            dtype=torch.long,
+            device=self.device,
+        )
+        tokens[:, :decoder_input.size(1)] = decoder_input
+        prompt_mask = (tokens == self.decoder.pad_idx)
+
         self.decoder.eval()
-        # not doing autocast here: for some reason here AMP is slower than full precision here
-        encoder_output = self.encoder(input, input_len=input_len)
 
-        predictions = []
-        done = [False for _ in range(bsz)]
-        total_done = 0
-        decoder_input = prefix
-        attn_weights = []
+        has_eos = torch.zeros(bsz, dtype=torch.bool, device=self.device)
 
-        for _ in range(self.max_len):
-            # generate at most max_len tokens
-            decoder_output, attn_weights_ = self.decoder(
-                input=decoder_input,
-                input_len=input_len,
+        prev_step = 0
+        for step in range(start, self.max_len):  # generate at most max_len tokens
+            logits, attn = self.decoder(
+                decoder_input=tokens[:,prev_step:step],
                 encoder_output=encoder_output,
+                encoder_mask=encoder_mask,
                 incremental=True,
                 return_attn=return_attn,
             )
 
-            _, preds = decoder_output.max(dim=2)
-            preds = preds[:,-1:]
-            predictions.append(preds.cpu())
-            decoder_input = preds  # set input to next step
+            next_logit = logits[:,-1]
 
-            attn_weights.append(attn_weights_)
+            # when a sequence is finished, put all logits to -inf except for <pad>
+            pad_prob = next_logit[:,self.decoder.pad_idx].clone()
+            next_logit.masked_fill_(has_eos.unsqueeze(1), -torch.inf)
+            next_logit[:,self.decoder.pad_idx] = pad_prob
 
-            # check if we've produced the end token
-            for b in range(bsz):
-                if not done[b]:
-                    # only add more tokens for examples that aren't done
-                    if preds[b][-1] == self.decoder.eos_idx:
-                        # if we produced END, we're done
-                        done[b] = True
-                        total_done += 1
-            if total_done == bsz:
-                # no need to generate any more
+            next_token = next_logit.argmax(dim=1)
+            # replace next token with prompt token where applicable
+            next_token = next_token.where(prompt_mask[:,step], tokens[:,step])
+            tokens[:,step] = next_token
+            yield tokens[:,prev_step + 1:step + 1], attn
+            has_eos = has_eos + (next_token == self.decoder.eos_idx)
+            has_eos = torch.logical_and(has_eos, (step >= prompt_len))  # EOS in the prompt shouldn't count
+            prev_step = step
+            if has_eos.all():
                 break
         
         self.decoder.reset_state()
-        
-        predictions = torch.cat(predictions, 1)
-        
-        attn = None if attn_weights[0] is None else torch.cat(attn_weights, 1).float().detach().cpu().numpy()
-        return self.vec2txt(predictions), attn
+
+    def decode(self, batch: dict[str, Any], return_attn: bool = False) -> tuple[list[str], Optional[Tensor]]:
+        source, prompt = batch['source'], batch['prompt']
+        prompt_len = (prompt != self.decoder.pad_idx).sum(dim=1)
+        if self.encoder is None:
+            # decoder-only architecture: the source sentence is part of the prompt
+            prompt_len = prompt_len + (source != self.decoder.pad_idx).sum(dim=1)
+        all_tokens = []
+        all_attn = []
+        for tokens, attn in self.stream(batch, return_attn=return_attn):  # concat all tokens and attention
+            all_tokens.append(tokens)
+            if attn is not None:
+                all_attn.append(attn)
+        all_tokens = torch.cat(all_tokens, dim=1)
+        # exclude prompt tokens and attention weights and convert token ids to strings
+        predictions = [self.vec2txt(tokens[n:].cpu()) for tokens, n in zip(all_tokens, prompt_len)]
+        if all_attn:
+            all_attn = torch.cat(all_attn, dim=1).cpu().numpy()
+            all_attn = [attn[n:] for attn, n in zip(all_attn, prompt_len)]
+        else:
+            all_attn = None
+        return predictions, all_attn
+
+    @staticmethod
+    def convert_llama_ckpt(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        llama_mapping = {  # maps llama parameter names to our parameter names
+            'model.embed_tokens.weight': 'decoder.embed_tokens.weight',
+            'model.norm.weight': 'decoder.layer_norm.weight',
+            'lm_head.weight': 'decoder.output_projection.weight',
+            'model.layers.0.input_layernorm.weight': 'decoder.layers.0.self_attn_layer_norm.weight',
+            'model.layers.0.post_attention_layernorm.weight': 'decoder.layers.0.final_layer_norm.weight',
+            'model.layers.0.self_attn.q_proj.weight': 'decoder.layers.0.self_attn.q_proj.weight',
+            'model.layers.0.self_attn.k_proj.weight': 'decoder.layers.0.self_attn.k_proj.weight',
+            'model.layers.0.self_attn.v_proj.weight': 'decoder.layers.0.self_attn.v_proj.weight',
+            'model.layers.0.self_attn.o_proj.weight': 'decoder.layers.0.self_attn.out_proj.weight',
+            'model.layers.0.self_attn.rotary_emb.inv_freq': None,
+            'model.layers.0.mlp.gate_proj.weight': 'decoder.layers.0.fc1.weight',
+            'model.layers.0.mlp.down_proj.weight': 'decoder.layers.0.fc2.weight',
+            'model.layers.0.mlp.up_proj.weight': 'decoder.layers.0.fc3.weight',
+        }
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            for old_name, new_name in llama_mapping.items():
+                pattern = re.escape(old_name).replace(r'\.0\.', r'\.(?P<layer_id>\d+)\.', 1)
+                if (m := re.fullmatch(pattern, k)):
+                    layer_id = m.groupdict().get('layer_id') or '0'
+                    k = None if new_name is None else new_name.replace('.0.', f'.{layer_id}.')
+                    break
+            if k is not None:
+                new_state_dict[k] = v
+        return new_state_dict
 
     def load(self, path: str, strict: bool = True, reset_optimizer: bool = False) -> None:
         if not os.path.isfile(path):
             return
         
         ckpt = torch.load(path, map_location='cpu')
+        if 'model' not in ckpt:  # HF checkpoints
+            ckpt = {'model': ckpt}
+
         model = ckpt['model']
+
+        model = self.convert_llama_ckpt(model)
 
         # Parameters that are sometimes present in fairseq checkpoints and that we don't need:
         model.pop('encoder.embed_positions._float_tensor', None)
@@ -870,118 +1111,13 @@ class EncoderDecoder(nn.Module):
         with model.adapter('en-fr'):
             translate(model, 'Hello, world')
         """
-        self.encoder.add_adapter(id, projection_dim, select=True, overwrite=overwrite)
+        if self.encoder is not None:
+            self.encoder.add_adapter(id, projection_dim, select=True, overwrite=overwrite)
         self.decoder.add_adapter(id, projection_dim, select=True, overwrite=overwrite)
         yield
-        self.encoder.select_adapter(None)
+        if self.encoder is not None:
+            self.encoder.select_adapter(None)
         self.decoder.select_adapter(None)
-
-
-class TransformerEncoderLayer(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        ffn_dim: Optional[int] = None,
-        has_bias: bool = True,
-        activation: str = 'relu',
-        rms_norm: bool = False,
-    ):
-        super().__init__()
-        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
-        self.embed_dim = embed_dim
-        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, has_bias=has_bias)
-        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim)
-        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim)
-        self.fc3 = nn.Linear(embed_dim, ffn_dim, bias=has_bias) if activation == 'swiglu' else None
-        self.dropout = nn.Dropout(dropout)
-        self.self_attn_layer_norm = LayerNorm(embed_dim)
-        self.final_layer_norm = LayerNorm(embed_dim)
-        self.activation_fn = F.silu if activation == 'swiglu' else getattr(F, activation)
-    
-    def forward(self, src: Tensor, padding_mask: Optional[BoolTensor] = None) -> Tensor:
-        x = src
-        residual = x
-        x = self.self_attn_layer_norm(x)
-        x, _ = self.self_attn(x, x, x, padding_mask=padding_mask)
-        x = residual + self.dropout(x)
-        residual = x
-        x = self.final_layer_norm(x)
-        y = self.fc1(x)
-        y = self.activation_fn(y)
-        y = self.dropout(y)
-        if self.fc3 is not None:
-            y = y * self.fc3(x)
-        x = self.fc2(y)
-        x = residual + self.dropout(x)
-        return x
-
-
-class TransformerDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        embed_dim: int,
-        num_heads: int,
-        dropout: float = 0.0,
-        ffn_dim: Optional[int] = None,
-        has_bias: bool = True,
-        activation: str = 'relu',
-        has_encoder: bool = True,
-        rms_norm: bool = False,
-    ):
-        super().__init__()
-        LayerNorm = RMSNorm if rms_norm else nn.LayerNorm
-        self.embed_dim = embed_dim
-        self.self_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, causal=True, has_bias=has_bias)
-        self.has_encoder = has_encoder
-        if has_encoder:
-            self.encoder_attn = MultiheadAttention(embed_dim, num_heads, dropout=dropout, has_bias=has_bias)
-        self.fc1 = nn.Linear(embed_dim, ffn_dim or embed_dim, bias=has_bias)
-        self.fc2 = nn.Linear(ffn_dim or embed_dim, embed_dim, bias=has_bias)
-        self.fc3 = nn.Linear(embed_dim, ffn_dim, bias=has_bias) if activation == 'swiglu' else None
-        self.dropout = nn.Dropout(dropout)
-        self.self_attn_layer_norm = LayerNorm(embed_dim)
-        if has_encoder:
-            self.encoder_attn_layer_norm = LayerNorm(embed_dim)
-        self.final_layer_norm = LayerNorm(embed_dim)
-        self.activation_fn = F.silu if activation == 'swiglu' else getattr(F, activation)
-
-    def forward(
-        self,
-        tgt: Tensor,
-        memory: Tensor,
-        encoder_mask: Optional[BoolTensor] = None,
-        incremental: bool = False,
-        return_attn: bool = False
-    ) -> tuple[Tensor, Optional[Tensor]]:
-        x = tgt
-        residual = x
-        x = self.self_attn_layer_norm(x)
-        x, _ = self.self_attn(
-            x, x, x, incremental=incremental, return_attn=False)
-        x = residual + self.dropout(x)
-
-        if self.has_encoder:
-            residual = x
-            x = self.encoder_attn_layer_norm(x)
-            x, attn_weights = self.encoder_attn(
-                x, memory, memory, padding_mask=encoder_mask, return_attn=return_attn)
-            x = residual + self.dropout(x)
-            if attn_weights is not None:  # BxTxHxS
-                attn_weights = attn_weights.sum(dim=2) / attn_weights.size(2)  # average all attention heads
-
-        residual = x
-        x = self.final_layer_norm(x)
-        y = self.fc1(x)
-        y = self.activation_fn(y)
-        y = self.dropout(y)
-        if self.fc3 is not None:
-            y = y * self.fc3(x)
-        x = self.fc2(y)
-        x = residual + self.dropout(x)
-
-        return x, attn_weights
 
 
 class PositionalEncoding(nn.Module):
@@ -1049,7 +1185,10 @@ class AdapterTransformerEncoderLayer(TransformerEncoderLayer):
 
 
 class AdapterTransformerEncoder(TransformerEncoder):
+    layer_cls = AdapterTransformerEncoderLayer
+
     def __init__(self, *args, **kwargs):
+        self.kwargs = kwargs
         super().__init__(*args, **kwargs)
         for param in self.parameters():
             param.requires_grad = False
@@ -1064,9 +1203,6 @@ class AdapterTransformerEncoder(TransformerEncoder):
         for layer in self.layers:
             assert id is None or id in layer.adapters
             layer.adapter_id = id
-
-    def build_layer(self, layer_id: int) -> 'AdapterTransformerEncoderLayer':
-        return AdapterTransformerEncoderLayer(self.embed_dim, self.num_heads, self.dropout_rate, self.ffn_dim)
 
 
 class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
@@ -1089,6 +1225,8 @@ class AdapterTransformerDecoderLayer(TransformerDecoderLayer):
 
 
 class AdapterTransformerDecoder(TransformerDecoder):
+    layer_cls = AdapterTransformerDecoderLayer
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         for param in self.parameters():
@@ -1104,9 +1242,6 @@ class AdapterTransformerDecoder(TransformerDecoder):
         for layer in self.layers:
             assert id is None or id in layer.adapters
             layer.adapter_id = id
-
-    def build_layer(self, layer_id: int) -> 'AdapterTransformerDecoderLayer':
-        return AdapterTransformerDecoderLayer(self.embed_dim, self.num_heads, self.dropout_rate, self.ffn_dim)
 
 
 class WarmupLR(LRScheduler):

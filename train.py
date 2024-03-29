@@ -51,6 +51,9 @@ parser.add_argument('--label-smoothing', type=float, default=0, help='Amount of 
 args = parser.parse_args()
 print(args)
 
+has_encoder = args.encoder_layers > 1
+assert has_encoder or args.model_type == 'transformer'
+assert has_encoder or args.shared_embeddings
 model_dir = os.path.dirname(args.checkpoint_path)
 bpe_path = args.bpe_path or os.path.join(args.data_dir, 'spm.de-en-fr.model')
 
@@ -165,6 +168,7 @@ for lang_pair in lang_pairs:
         batch_size=args.batch_size,
         max_len=args.max_len,
         shuffle=True,
+        source_as_prompt=not has_encoder,
     )
     train_iterators.append(train_iterator)
     valid_iterator = data.BatchIterator(
@@ -172,6 +176,7 @@ for lang_pair in lang_pairs:
         batch_size=args.batch_size,
         max_len=args.max_len,
         shuffle=False,
+        source_as_prompt=not has_encoder,
     )
     valid_iterators.append(valid_iterator)
 
@@ -181,7 +186,7 @@ else:
     train_iterator = train_iterators[0]
 
 
-def evaluate_model(model, *test_or_valid_iterators, record=False):
+def evaluate_model(model: models.EncoderDecoder, *test_or_valid_iterators, record=False):
     """
     Evaluate given models with given test or validation sets. This will compute both chrF and validation loss.
     
@@ -202,10 +207,15 @@ def evaluate_model(model, *test_or_valid_iterators, record=False):
         
         for batch in iterator:
             loss += model.eval_step(batch) / len(iterator)
-            hyps, _ = model.translate(batch)
+            hyps, _ = model.decode(batch)
             hypotheses += [postprocess(hyp) for hyp in hyps]  # detokenize
             references += batch['reference']
         
+        if args.verbose:
+            for hyp, ref in zip(hypotheses[:3], references[:3]):
+                print('Hypothesis:', hyp)
+                print('Reference: ', ref)
+
         chrf = sacrebleu.corpus_chrf(hypotheses, [references]).score
 
         src, tgt = iterator.source_lang, iterator.target_lang
@@ -309,10 +319,10 @@ elif args.model_type == 'rnn':
     encoder = models.RNN_Encoder(**encoder_args)
     decoder = models.RNN_Decoder(**decoder_args)
 else:
-    encoder = models.TransformerEncoder(**encoder_args, num_heads=args.heads)
-    decoder = models.TransformerDecoder(**decoder_args, num_heads=args.heads)
+    encoder = models.TransformerEncoder(**encoder_args, num_heads=args.heads) if has_encoder else None
+    decoder = models.TransformerDecoder(**decoder_args, num_heads=args.heads, has_encoder=has_encoder)
 
-if args.shared_embeddings:
+if args.shared_embeddings and has_encoder:
     decoder.embed_tokens = encoder.embed_tokens
 
 scheduler_args = json.loads(args.scheduler_args) if args.scheduler_args else {}
