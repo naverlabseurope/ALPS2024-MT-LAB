@@ -1,7 +1,9 @@
 # ALPS2024-MT-LAB
-Python notebook and models for the [MT Lab @ ALPS 2024](http://lig-alps.imag.fr)
+Python notebook and models for the [Machine Translation Lab @ ALPS 2024](http://lig-alps.imag.fr)
 
 This repository is a modified version of [another tutorial on NMT](https://github.com/nyu-dl/AMMI-2019-NLP-Part2/blob/master/02-day-RLM%26NMT/02.c.NMT/NMT.ipynb) by Kyunghyun Cho et al.
+
+**Note that this repo implements a very basic MT library, which will not scale very well to large datasets or large models. For a more advanced and versatile MT framework, check out [Pasero](https://github.com/naver/pasero)!**
 
 ### Running on Google Colab
 
