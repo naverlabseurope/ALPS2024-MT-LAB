@@ -29,7 +29,7 @@ def preprocess(line, lang):
 def read_corpus(src_lang, tgt_lang='en'):
     assert src_lang != tgt_lang
     pair = '-'.join(sorted([src_lang, tgt_lang]))
-    url = f'https://opus.nlpl.eu/download.php?f=Tatoeba/v2022-03-03/moses/{pair}.txt.zip'
+    url = f'https://object.pouta.csc.fi/OPUS-Tatoeba/v2023-04-12/moses/{pair}.txt.zip'
     src_filename = f'Tatoeba.{pair}.{src_lang}'
     tgt_filename = f'Tatoeba.{pair}.{tgt_lang}'
     print(f'Downloading {pair} data from {url}')
