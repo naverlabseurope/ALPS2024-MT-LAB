@@ -302,8 +302,13 @@ def load_dataset(
         )
 
 
-def concatenate_datasets(datasets: list[pd.DataFrame]) -> pd.DataFrame:
-    return pd.concat(datasets, ignore_index=True)
+def concatenate_datasets(datasets: list[pd.DataFrame], shuffle: bool = False) -> pd.DataFrame:
+    datasets = list(datasets)
+    dataset = pd.concat(datasets, ignore_index=True)
+    dataset.pad_idx = datasets[0].pad_idx
+    if shuffle:
+        dataset = dataset.sample(frac=1)
+    return dataset
 
 
 class BatchIterator:
